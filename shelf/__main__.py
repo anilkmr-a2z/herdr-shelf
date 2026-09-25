@@ -12,7 +12,7 @@ from . import activity, agents, archive, config, picker, restore, sweep
 from .api import Client, HerdrError
 from .util import FileLock, LockBusy, now
 
-PLUGIN_ID = "anilkmr.shelf"
+PLUGIN_ID = "shelf"
 ALWAYS_HOOKS = ("track", "open-picker")
 USAGE = ("usage: python3 -m shelf {track | sweep [--if-due] | archive <tab-id> | open-picker | pick | "
          "list | restore <archive-id>}")

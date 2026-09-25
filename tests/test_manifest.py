@@ -14,7 +14,7 @@ class ManifestTest(unittest.TestCase):
     def test_manifest(self):
         path = Path(__file__).resolve().parent.parent / "herdr-plugin.toml"
         m = tomllib.loads(path.read_text())
-        self.assertEqual(m["id"], "anilkmr.shelf")
+        self.assertEqual(m["id"], "shelf")
         self.assertEqual(m["version"], shelf.__version__)
         self.assertEqual(m["min_herdr_version"], "0.9.0")
         self.assertEqual({a["id"] for a in m["actions"]}, {"restore", "sweep-now"})

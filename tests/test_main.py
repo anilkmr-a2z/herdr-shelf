@@ -50,7 +50,7 @@ class MainTest(unittest.TestCase):
         # would on a developer's own machine) must never be consulted: setUp
         # points XDG_CONFIG_HOME elsewhere, so HOME alone must not matter.
         fake_home = os.path.join(self.tmp.name, "developer-home")
-        broken_config_dir = Path(fake_home) / ".config" / "herdr" / "plugins" / "config" / "anilkmr.shelf"
+        broken_config_dir = Path(fake_home) / ".config" / "herdr" / "plugins" / "config" / "shelf"
         broken_config_dir.mkdir(parents=True)
         (broken_config_dir / "config.json").write_text("{not valid json")
         os.environ.pop("HERDR_PLUGIN_CONFIG_DIR", None)
@@ -164,7 +164,7 @@ class MainTest(unittest.TestCase):
         xdg_state = os.path.join(self.tmp.name, "xdg-state")
         os.makedirs(home, exist_ok=True)
         with mock.patch.dict(os.environ, {"HOME": home, "XDG_STATE_HOME": xdg_state}):
-            state_dir = Path(xdg_state) / "herdr" / "plugins" / "anilkmr.shelf"
+            state_dir = Path(xdg_state) / "herdr" / "plugins" / "shelf"
             archive_dir = state_dir / "archive" / "20260101T000000Z-abcdef"
             archive_dir.mkdir(parents=True)
             (archive_dir / "record.json").write_text(json.dumps({
@@ -182,7 +182,7 @@ class MainTest(unittest.TestCase):
         xdg_config = os.path.join(self.tmp.name, "xdg-config")
         os.makedirs(home, exist_ok=True)
         with mock.patch.dict(os.environ, {"HOME": home, "XDG_CONFIG_HOME": xdg_config}):
-            config_dir = Path(xdg_config) / "herdr" / "plugins" / "config" / "anilkmr.shelf"
+            config_dir = Path(xdg_config) / "herdr" / "plugins" / "config" / "shelf"
             config_dir.mkdir(parents=True)
             (config_dir / "config.json").write_text('{"idle_days": -1}')
             err = io.StringIO()
@@ -276,10 +276,10 @@ class MainTest(unittest.TestCase):
         fake = FakeHerdr()
         self.addCleanup(fake.close)
         fake.handlers["plugin.pane.open"] = lambda p: {"type": "ok"}
-        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path, "HERDR_PLUGIN_ID": "anilkmr.shelf"}):
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path, "HERDR_PLUGIN_ID": "shelf"}):
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(main(["open-picker"]), 0)
-        self.assertEqual(fake.calls, [("plugin.pane.open", {"plugin_id": "anilkmr.shelf", "entrypoint": "picker"})])
+        self.assertEqual(fake.calls, [("plugin.pane.open", {"plugin_id": "shelf", "entrypoint": "picker"})])
 
     def test_manual_archive_lock_busy_prints_friendly_message_not_the_lock_path(self):
         fake = FakeHerdr()

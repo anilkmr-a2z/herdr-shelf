@@ -221,7 +221,7 @@ A history source for it is optional.
 ## Manifest
 
 ```toml
-id = "anilkmr.shelf"
+id = "shelf"
 name = "Shelf"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
@@ -270,7 +270,7 @@ multiple times per focus change without adding any coverage.
 
 ## Configuration
 
-`config.json` in the directory printed by `herdr plugin config-dir anilkmr.shelf`.
+`config.json` in the directory printed by `herdr plugin config-dir shelf`.
 JSON is used because Python 3.9 has no TOML parser and the agent overrides are
 nested. All keys are optional.
 
@@ -564,7 +564,7 @@ resumes with its original launch flags.
    [[keys.command]]
    key = "prefix+shift+s"        # free in the default keymap; prefix+s is settings
    type = "plugin_action"
-   command = "anilkmr.shelf.restore"
+   command = "shelf.restore"
    description = "restore an archived tab"
    ```
 

@@ -27,7 +27,7 @@ Add a key for the restore picker to `~/.config/herdr/config.toml`, then run
 [[keys.command]]
 key = "prefix+shift+s"
 type = "plugin_action"
-command = "anilkmr.shelf.restore"
+command = "shelf.restore"
 description = "restore an archived tab"
 ```
 
@@ -103,7 +103,7 @@ use `agents` in `config.json`.
 ## Configuration
 
 `config.json` in the directory printed by
-`herdr plugin config-dir anilkmr.shelf`. Every key is optional. Changes take
+`herdr plugin config-dir shelf`. Every key is optional. Changes take
 effect the next time a hook runs (the next status change, focus change, or
 sweep); there is nothing to reload.
 
@@ -135,11 +135,11 @@ sweep); there is nothing to reload.
 
 ## Command line
 
-For routine use, prefer the herdr actions `anilkmr.shelf.sweep-now` and
-`anilkmr.shelf.restore` over the raw commands below.
+For routine use, prefer the herdr actions `shelf.sweep-now` and
+`shelf.restore` over the raw commands below.
 
 To run a command by hand, find the plugin's directory with
-`herdr plugin list --plugin anilkmr.shelf --json` (the `plugin_root` field)
+`herdr plugin list --plugin shelf --json` (the `plugin_root` field)
 and run from there, so `python3 -m shelf` finds the `shelf` package. The CLI
 looks up the same state and config directories the plugin itself uses (the
 same environment variables when herdr sets them, the same defaults
@@ -155,19 +155,19 @@ python3 -m shelf restore <archive-id>  restore one archived tab
 Tab ids for `archive` come from `herdr tab list`.
 
 `shelf.log` in the plugin's state directory is the durable log.
-`herdr plugin log list --plugin anilkmr.shelf` also shows recent plugin
+`herdr plugin log list --plugin shelf` also shows recent plugin
 output, but herdr keeps that log in memory and it is short-lived, so
 `shelf.log` is the one to check for anything older than the last few
 commands.
 
 ## Where things live
 
-State: `$XDG_STATE_HOME/herdr/plugins/anilkmr.shelf`, or
-`~/.local/state/herdr/plugins/anilkmr.shelf` when `XDG_STATE_HOME` is not
+State: `$XDG_STATE_HOME/herdr/plugins/shelf`, or
+`~/.local/state/herdr/plugins/shelf` when `XDG_STATE_HOME` is not
 set. It holds `archive/` (one folder per archived tab), `activity.json`, and
 `shelf.log`.
 
-Config: the directory printed by `herdr plugin config-dir anilkmr.shelf`.
+Config: the directory printed by `herdr plugin config-dir shelf`.
 
 ## Uninstall
 
@@ -175,7 +175,7 @@ Restore anything you want to keep first: an uninstall does not bring archived
 tabs back on its own.
 
 ```sh
-herdr plugin uninstall anilkmr.shelf
+herdr plugin uninstall shelf
 ```
 
 Remove the `[[keys.command]]` block added in Install from
