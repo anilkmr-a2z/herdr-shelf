@@ -61,6 +61,8 @@ class Client:
         if not isinstance(response, dict):
             raise HerdrError("bad_response", "reply was not a JSON object", definite=False)
         if response.get("error"):
-            err = response["error"] or {}
+            err = response["error"]
+            if not isinstance(err, dict):
+                err = {"message": str(err)}
             raise HerdrError(err.get("code", "error"), err.get("message", ""), definite=True)
         return response.get("result") or {}

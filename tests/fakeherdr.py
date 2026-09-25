@@ -52,21 +52,27 @@ class FakeHerdr:
                     buf += chunk
                 if not buf:
                     continue
-                req = json.loads(buf)
-                params = req.get("params") or {}
-                self.calls.append((req["method"], params))
-                handler = self.handlers.get(req["method"])
-                if handler is None:
-                    resp = {"id": req["id"], "error": {"code": "unknown_method", "message": req["method"]}}
-                else:
-                    try:
-                        resp = {"id": req["id"], "result": handler(params)}
-                    except FakeError as e:
-                        resp = {"id": req["id"], "error": {"code": e.code, "message": e.message}}
-                    except Exception as e:
-                        self.errors.append(e)
-                        resp = {"id": req["id"], "error": {"code": "fake_handler_error", "message": repr(e)}}
-                conn.sendall((json.dumps(resp) + "\n").encode())
+                req = None
+                try:
+                    req = json.loads(buf)
+                    params = req.get("params") or {}
+                    self.calls.append((req["method"], params))
+                    handler = self.handlers.get(req["method"])
+                    if handler is None:
+                        resp = {"id": req["id"], "error": {"code": "unknown_method", "message": req["method"]}}
+                    else:
+                        try:
+                            resp = {"id": req["id"], "result": handler(params)}
+                        except FakeError as e:
+                            resp = {"id": req["id"], "error": {"code": e.code, "message": e.message}}
+                    payload = (json.dumps(resp) + "\n").encode()
+                except Exception as e:
+                    self.errors.append(e)
+                    req_id = req["id"] if isinstance(req, dict) and "id" in req else "unknown"
+                    payload = (json.dumps(
+                        {"id": req_id, "error": {"code": "fake_handler_error", "message": repr(e)}}
+                    ) + "\n").encode()
+                conn.sendall(payload)
 
     def methods(self):
         return [m for m, _ in self.calls]
@@ -80,3 +86,5 @@ class FakeHerdr:
         except FileNotFoundError:
             pass
         os.rmdir(self._dir)
+        if self.errors:
+            raise AssertionError(f"fake handler errors: {self.errors!r}")

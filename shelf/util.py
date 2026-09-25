@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import tempfile
@@ -15,6 +16,7 @@ from typing import Any
 UTC = timezone.utc
 _FRACTION = re.compile(r"\.(\d+)")
 _OFFSET_NO_COLON = re.compile(r"([+-]\d{2})(\d{2})$")
+_LOG = logging.getLogger("shelf")
 
 
 def now() -> datetime:
@@ -53,7 +55,10 @@ def read_json(path: Path, default: Any) -> Any:
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
+        return default
+    except ValueError:
+        _LOG.warning("%s is not valid JSON; ignoring it", path)
         return default
 
 
@@ -106,17 +111,20 @@ class FileLock:
     def __enter__(self) -> "FileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
-        deadline = time.monotonic() + self.wait_seconds
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    os.close(fd)
-                    raise LockBusy(str(self.path))
-                time.sleep(0.05)
-                continue
-            break
+        try:
+            deadline = time.monotonic() + self.wait_seconds
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise LockBusy(str(self.path))
+                    time.sleep(0.05)
+                    continue
+                break
+        except BaseException:
+            os.close(fd)
+            raise
         self._fd = fd
         return self
 

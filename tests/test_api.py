@@ -1,7 +1,9 @@
+import json
 import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -60,6 +62,9 @@ class ClientTest(unittest.TestCase):
         self.assertIsInstance(self.fake.errors[0], RuntimeError)
         result = Client(self.fake.path).call("ping")
         self.assertEqual(result, {"ok": True})
+        # This test deliberately triggers a handler error; close() now asserts
+        # on leftover errors, so acknowledge it was expected before teardown.
+        self.fake.errors.clear()
 
     def test_close_without_reply_is_empty_response(self):
         d = tempfile.mkdtemp(prefix="shelf-")
@@ -92,6 +97,125 @@ class ClientTest(unittest.TestCase):
         result = Client(self.fake.path).call("big")
         self.assertEqual(len(result["data"]), 100000)
         self.assertEqual(result["data"], big)
+
+    def test_close_raises_when_errors_recorded(self):
+        fake = FakeHerdr()
+        fake.errors.append(RuntimeError("boom"))
+        with self.assertRaises(AssertionError):
+            fake.close()
+        # Cleanup must still have happened despite the raise.
+        self.assertFalse(os.path.exists(fake.path))
+        self.assertFalse(os.path.exists(os.path.dirname(fake.path)))
+
+    def test_malformed_request_replies_unknown_id_and_keeps_serving(self):
+        self.fake.handlers["ping"] = lambda p: {"ok": True}
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect(self.fake.path)
+        sock.sendall(b"not json\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        sock.close()
+        resp = json.loads(buf)
+        self.assertEqual(resp["id"], "unknown")
+        self.assertEqual(resp["error"]["code"], "fake_handler_error")
+        self.assertEqual(len(self.fake.errors), 1)
+        self.fake.errors.clear()
+        result = Client(self.fake.path).call("ping")
+        self.assertEqual(result, {"ok": True})
+
+    def test_unserializable_result_records_error_and_keeps_serving(self):
+        self.fake.handlers["bad"] = lambda p: {"nope": object()}
+        self.fake.handlers["ping"] = lambda p: {"ok": True}
+        with self.assertRaises(HerdrError) as ctx:
+            Client(self.fake.path).call("bad")
+        self.assertEqual(ctx.exception.code, "fake_handler_error")
+        self.assertEqual(len(self.fake.errors), 1)
+        self.fake.errors.clear()
+        result = Client(self.fake.path).call("ping")
+        self.assertEqual(result, {"ok": True})
+
+    def test_truncated_reply_is_bad_response(self):
+        d = tempfile.mkdtemp(prefix="shelf-")
+        path = os.path.join(d, "h.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def serve_once():
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(b'{"id": "x", "res')
+
+        t = threading.Thread(target=serve_once)
+        t.start()
+        try:
+            with self.assertRaises(HerdrError) as ctx:
+                Client(path).call("tab.list")
+            self.assertEqual(ctx.exception.code, "bad_response")
+            self.assertFalse(ctx.exception.definite)
+        finally:
+            t.join(5)
+            server.close()
+            os.unlink(path)
+            os.rmdir(d)
+
+    def test_never_replies_is_io_error(self):
+        d = tempfile.mkdtemp(prefix="shelf-")
+        path = os.path.join(d, "h.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def serve_once():
+            conn, _ = server.accept()
+            time.sleep(1.0)
+            conn.close()
+
+        t = threading.Thread(target=serve_once)
+        t.start()
+        try:
+            with self.assertRaises(HerdrError) as ctx:
+                Client(path, timeout=0.3).call("tab.list")
+            self.assertEqual(ctx.exception.code, "io")
+            self.assertFalse(ctx.exception.definite)
+        finally:
+            t.join(5)
+            server.close()
+            os.unlink(path)
+            os.rmdir(d)
+
+    def test_non_dict_error_value_becomes_message(self):
+        d = tempfile.mkdtemp(prefix="shelf-")
+        path = os.path.join(d, "h.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def serve_once():
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(b'{"id": "x", "error": "boom"}\n')
+
+        t = threading.Thread(target=serve_once)
+        t.start()
+        try:
+            with self.assertRaises(HerdrError) as ctx:
+                Client(path).call("tab.list")
+            self.assertEqual(ctx.exception.code, "error")
+            self.assertEqual(ctx.exception.message, "boom")
+            self.assertTrue(ctx.exception.definite)
+        finally:
+            t.join(5)
+            server.close()
+            os.unlink(path)
+            os.rmdir(d)
 
 
 if __name__ == "__main__":
