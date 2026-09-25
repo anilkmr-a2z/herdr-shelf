@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from shelf import picker
+from shelf import archive, picker
 from shelf.util import FileLock, LockBusy
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
@@ -174,6 +174,15 @@ class RunTest(unittest.TestCase):
     def test_failed_restore_keeps_picker_open(self):
         _, _, out, _ = self.run_picker(["1", "", "q"], restore_error=RuntimeError("boom"))
         self.assertTrue(any("Restore failed: boom" in line for line in out))
+
+    def test_duplicate_conversation_skip_is_shown_and_keeps_the_entry(self):
+        arch, restored, out, _ = self.run_picker(
+            ["1", "", "q"],
+            restore_error=archive.Skip("conversation ab12cd34 is already open in another tab; close it first"))
+        self.assertTrue(any("Restore failed: conversation ab12cd34 is already open in another tab" in line
+                             for line in out))
+        self.assertEqual(arch.deleted, [])
+        self.assertEqual([r["id"] for r in arch.list()], ["b", "a"])
 
     def test_warnings_are_shown_via_notify_without_waiting_for_input(self):
         _, restored, _, notifications = self.run_picker(["1"], warnings=["conversation missing"])

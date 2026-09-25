@@ -13,6 +13,16 @@ from .util import FileLock, atomic_write_json, iso, parse_iso, read_json
 ACTIVE_STATUSES = frozenset({"working", "blocked", "done"})
 TOUCH_SKIP = timedelta(seconds=60)
 
+# How long after herdr's own startup a pane.agent_detected event is assumed to
+# be herdr resuming a pane it restored itself, rather than the user (re)starting
+# an agent by hand -- so that resume must not count as activity.
+STARTUP_GRACE = timedelta(minutes=10)
+
+# Reserved top-level key in activity.json for per-terminal data (currently
+# just agent_started_at). Every other top-level key is a "<agent>:<value>"
+# session record; code that iterates activity.json must skip this one.
+TERMINALS_KEY = "terminals"
+
 
 def session_key(agent: str, value: str) -> str:
     return f"{agent}:{value}"
@@ -112,8 +122,46 @@ def effective(rec: dict, history_ts: datetime | None, installed_at: datetime | N
     return max(present) if present else None
 
 
+def _server_started_at(state_dir) -> datetime | None:
+    try:
+        text = (Path(state_dir) / "server_started_at").read_text().strip()
+    except FileNotFoundError:
+        return None
+    return parse_iso(text)
+
+
+def _in_startup_grace(state_dir, now: datetime) -> bool:
+    started = _server_started_at(state_dir)
+    return started is not None and now - started < STARTUP_GRACE
+
+
+def record_terminal_started(data: dict, terminal_id: str, now: datetime) -> bool:
+    """Record that an agent (re)started in this pane's terminal, keyed by
+    terminal_id rather than session, so a resume with no user or assistant
+    message still counts as activity."""
+    data.setdefault(TERMINALS_KEY, {})[terminal_id] = {"agent_started_at": iso(now)}
+    return True
+
+
+def _track_agent_detected(client, store: ActivityStore, data: dict, pane_id: str, now: datetime) -> bool:
+    """Handle one pane.agent_detected event: a truthy agent that was not
+    released means an agent is now running in this pane (started or
+    restarted). herdr's own resume of a restored pane, right after herdr
+    itself starts, must not count -- that is the startup grace period.
+    """
+    if not data.get("agent") or data.get("released"):
+        return False
+    pane = client.call("pane.get", {"pane_id": pane_id}).get("pane") or {}
+    terminal_id = pane.get("terminal_id")
+    if not terminal_id:
+        return False
+    if _in_startup_grace(store.path.parent, now):
+        return False
+    return store.update(lambda d: record_terminal_started(d, terminal_id, now))
+
+
 def track(client, store: ActivityStore, event_json: str | None, env_pane_id: str | None, now: datetime) -> bool:
-    """Handle one pane.agent_status_changed event.
+    """Handle one pane.agent_status_changed or pane.agent_detected event.
 
     Returns whether activity.json was actually changed as a result.
     """
@@ -126,9 +174,13 @@ def track(client, store: ActivityStore, event_json: str | None, env_pane_id: str
     data = parsed.get("data")
     if not isinstance(data, dict):
         return False
-    status = data.get("agent_status")
     pane_id = data.get("pane_id") or env_pane_id
-    if status not in ACTIVE_STATUSES or not pane_id:
+    if not pane_id:
+        return False
+    if parsed.get("event") == "pane.agent_detected":
+        return _track_agent_detected(client, store, data, pane_id, now)
+    status = data.get("agent_status")
+    if status not in ACTIVE_STATUSES:
         return False
     pane = client.call("pane.get", {"pane_id": pane_id}).get("pane") or {}
     session = pane.get("agent_session")

@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from . import activity, agents, history, picker
+from . import activity, agents, archive, history, picker
 from .api import HerdrError
 from .util import FileLock
 
@@ -85,6 +85,18 @@ def restore(client, arch, store, archive_id: str, table: dict, now: datetime) ->
         for cwd in missing_cwds:
             warnings.append(f"{label}: {cwd} no longer exists; "
                             "the pane opens in herdr's fallback directory")
+
+        # Before touching anything else (in particular before layout.apply,
+        # or workspace.create for a recreated workspace): if this conversation
+        # is already open in a live tab, restoring it here would put the same
+        # conversation in two tabs at once. Refuse and keep the archive entry.
+        live_panes = client.call("pane.list").get("panes", [])
+        live_sessions = {p["agent_session"]["value"] for p in live_panes
+                         if isinstance(p.get("agent_session"), dict) and p["agent_session"].get("value")}
+        for meta in panes.values():
+            value = (meta.get("session") or {}).get("value")
+            if value and value in live_sessions:
+                raise archive.Skip(f"conversation {value[:8]} is already open in another tab; close it first")
 
         argv_log = {}
         params = {"root": build_tree(record["layout"]["root"], panes, table, argv_log),

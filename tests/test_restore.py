@@ -80,6 +80,7 @@ class RestoreTest(unittest.TestCase):
         self.fake.handlers["layout.apply"] = layout_apply
         self.fake.handlers["workspace.list"] = lambda p: {"workspaces": [
             {"workspace_id": "w0", "label": "other"}, {"workspace_id": "w1", "label": "api-service"}]}
+        self.fake.handlers["pane.list"] = lambda p: {"panes": []}
 
     def _record_with_existing_pane_cwds(self, **overrides):
         record = copy.deepcopy(RECORD)
@@ -198,6 +199,24 @@ class RestoreTest(unittest.TestCase):
             with self.assertRaises(LockBusy):
                 self.run_restore()
         self.assertNotIn("layout.apply", [m for m, _ in self.fake.calls])
+
+    def test_duplicate_conversation_open_elsewhere_raises_skip_and_keeps_entry(self):
+        self.fake.handlers["pane.list"] = lambda p: {"panes": [
+            {"pane_id": "w9:p1", "tab_id": "w9:t1", "terminal_id": "term_other", "agent": "claude",
+             "agent_session": {"agent": "claude", "kind": "id", "value": "S1", "source": "herdr:claude"}}]}
+        with self.assertRaises(archive.Skip) as cm:
+            self.run_restore()
+        self.assertIn("S1"[:8], str(cm.exception))
+        self.assertIn("already open in another tab", str(cm.exception))
+        self.assertEqual(len(self.arch.list()), 1)
+        self.assertNotIn("layout.apply", [m for m, _ in self.fake.calls])
+
+    def test_unrelated_live_sessions_do_not_block_restore(self):
+        self.fake.handlers["pane.list"] = lambda p: {"panes": [
+            {"pane_id": "w9:p1", "tab_id": "w9:t1", "terminal_id": "term_other", "agent": "claude",
+             "agent_session": {"agent": "claude", "kind": "id", "value": "SOMETHING_ELSE", "source": "herdr:claude"}}]}
+        result = self.run_restore()
+        self.assertEqual(result["tab_id"], "w1:t7")
 
     def test_warnings_fall_back_to_workspace_label_or_tab_when_both_are_none(self):
         (self.claude / "projects" / "-src-api" / "S1.jsonl").unlink()

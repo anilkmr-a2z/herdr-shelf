@@ -1,6 +1,6 @@
 id = "shelf"
 name = "Shelf"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.9.0"
 description = "Archive agent tabs that have been inactive for days, and restore them with their conversation resumed."
 platforms = ["linux", "macos"]
@@ -10,6 +10,10 @@ command = ["python3", "-m", "shelf", "sweep", "--if-due"]
 
 [[events]]
 on = "pane.agent_status_changed"
+command = ["python3", "-m", "shelf", "track"]
+
+[[events]]
+on = "pane.agent_detected"
 command = ["python3", "-m", "shelf", "track"]
 
 [[events]]

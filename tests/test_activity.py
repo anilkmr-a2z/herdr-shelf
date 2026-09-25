@@ -2,9 +2,11 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from shelf import activity
 from shelf.api import Client
+from shelf.util import iso
 from tests.fakeherdr import FakeHerdr
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
@@ -176,6 +178,59 @@ class StoreAndTrackTest(unittest.TestCase):
         self.assertTrue(activity.track(client, self.store, self.event("working"), None, T0))
         # Same session, same status, well within the 60s skip: no write happens.
         self.assertFalse(activity.track(client, self.store, self.event("working"), None, T0 + timedelta(seconds=1)))
+
+
+class AgentDetectedTrackTest(unittest.TestCase):
+    """track() handling pane.agent_detected: an agent (re)started in a pane
+    counts as activity, keyed by the pane's terminal, unless herdr itself is
+    still resuming panes from its own restart (the startup grace period)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = activity.ActivityStore(self.tmp.name)
+        self.fake = FakeHerdr()
+        self.addCleanup(self.fake.close)
+        self.fake.handlers["pane.get"] = lambda p: {"pane": {"pane_id": p["pane_id"], "terminal_id": "term1"}}
+
+    def event(self, agent="claude", released=False, pane_id="w1:p1", include_agent=True):
+        data = {"pane_id": pane_id, "released": released}
+        if include_agent:
+            data["agent"] = agent
+        return json.dumps({"event": "pane.agent_detected", "data": data})
+
+    def test_agent_detected_records_agent_started_at(self):
+        client = Client(self.fake.path)
+        self.assertTrue(activity.track(client, self.store, self.event(), None, T0))
+        self.assertEqual(self.store.load()["terminals"]["term1"]["agent_started_at"], "2026-09-24T12:00:00Z")
+
+    def test_released_event_is_ignored(self):
+        client = Client(self.fake.path)
+        self.assertFalse(activity.track(client, self.store, self.event(released=True), None, T0))
+        self.assertEqual(self.store.load(), {})
+
+    def test_missing_agent_is_ignored(self):
+        client = Client(self.fake.path)
+        self.assertFalse(activity.track(client, self.store, self.event(include_agent=False), None, T0))
+        self.assertEqual(self.store.load(), {})
+
+    def test_within_startup_grace_records_nothing(self):
+        (Path(self.tmp.name) / "server_started_at").write_text(iso(T0) + "\n")
+        client = Client(self.fake.path)
+        self.assertFalse(activity.track(client, self.store, self.event(), None, T0 + timedelta(minutes=5)))
+        self.assertEqual(self.store.load(), {})
+
+    def test_after_startup_grace_records_normally(self):
+        (Path(self.tmp.name) / "server_started_at").write_text(iso(T0) + "\n")
+        client = Client(self.fake.path)
+        self.assertTrue(activity.track(client, self.store, self.event(), None, T0 + timedelta(minutes=11)))
+        self.assertIn("term1", self.store.load()["terminals"])
+
+    def test_no_terminal_id_is_ignored(self):
+        self.fake.handlers["pane.get"] = lambda p: {"pane": {"pane_id": p["pane_id"]}}
+        client = Client(self.fake.path)
+        self.assertFalse(activity.track(client, self.store, self.event(), None, T0))
+        self.assertEqual(self.store.load(), {})
 
 
 if __name__ == "__main__":

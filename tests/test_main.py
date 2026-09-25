@@ -76,6 +76,26 @@ class MainTest(unittest.TestCase):
         self.assertTrue(log_path.exists())
         self.assertIn("track", log_path.read_text())
 
+    def test_startup_event_records_server_started_at(self):
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT": "startup"}), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["sweep", "--if-due"]), 0)
+        path = Path(self.tmp.name) / "server_started_at"
+        self.assertTrue(path.exists())
+        self.assertIn("T", path.read_text())
+
+    def test_non_startup_event_does_not_record_server_started_at(self):
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT": "workspace.focused"}), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["sweep", "--if-due"]), 0)
+        self.assertFalse((Path(self.tmp.name) / "server_started_at").exists())
+
+    def test_server_started_at_is_recorded_even_when_the_sweep_is_not_due(self):
+        # The due check (and the "not due" early return) must not skip this:
+        # it has to happen before any due check or early return.
+        (Path(self.tmp.name) / "last_sweep").write_text(iso(now()) + "\n")
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT": "startup"}), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["sweep", "--if-due"]), 0)
+        self.assertTrue((Path(self.tmp.name) / "server_started_at").exists())
+
     def test_if_due_hook_skips_loading_config_when_not_due(self):
         # A sweep just happened (last_sweep is recent), so this is not due
         # per the default 60-minute interval: config.load must never even be

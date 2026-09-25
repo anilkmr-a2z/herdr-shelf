@@ -77,6 +77,27 @@ reuses pane and tab ids.
   tab left waiting for input would never age.
 - A session seen for the first time gets `first_seen = now`. With generic tracking
   alone, no tab is archived until `idle_days` after the plugin first sees it.
+- The `pane.agent_detected` hook records that an agent (re)started in a pane:
+  a truthy `agent` and `released` false means an agent is now running there,
+  whether that is the user starting one for the first time, resuming an old
+  conversation by hand (for example `claude --resume <id>`), or an agent
+  restarting on its own. This is recorded per pane terminal (`pane.get`'s
+  `terminal_id`), as `agent_started_at`, because starting an agent sends no
+  user or assistant message of its own and updates no session's `last_active`
+  or history timestamp -- without this, a freshly (re)started agent in an old
+  session would still look exactly as idle as it did before it started.
+  herdr fires this same event, with `agent` empty or `released` true, when an
+  agent's pane is released (the process exited or the pane closed); those are
+  ignored.
+- Startup grace period: for 10 minutes after herdr's own startup, a
+  `pane.agent_detected` event is assumed to be herdr resuming a pane it
+  itself restored (herdr's own resume on a server restart, see "What herdr
+  provides" above) rather than the user or an agent (re)starting by hand, and
+  is not recorded. herdr's startup hook fires with `HERDR_PLUGIN_EVENT=startup`;
+  the plugin records that moment as `server_started_at` (ISO, in the state
+  directory) before doing anything else -- in particular before the sweep
+  hook's own due check -- so the grace period is available even on a sweep
+  that turns out not to be due.
 
 ### History sources (optional, per agent)
 
@@ -118,7 +139,14 @@ For a session, effective activity is the latest of:
   very first sweep has `first_seen == installed_at` (not strictly later), so
   for those the history timestamp alone decides;
 - `restored_at`, the last time this plugin restored the session. Without it, a
-  restored tab would be archived again on the next sweep.
+  restored tab would be archived again on the next sweep;
+- the pane's own `agent_started_at`, if its terminal has one recorded, so a
+  pane where an agent was just (re)started counts as active for that pane's
+  tab even when the session's own record is old. This term is not part of a
+  session's own effective activity (`activity.effective` stays about session
+  records only); it is folded in one level up, in the activity lookup a sweep
+  builds, which takes the pane's `terminal_id` and returns the later of the
+  session's effective activity and that terminal's `agent_started_at`.
 
 ## Eligibility
 
@@ -131,12 +159,25 @@ A tab is archived when all of the following hold:
    whose agent no longer matches is never used to decide or resume that pane.
 3. Every agent pane has an `agent_session`, its agent has an entry in the agent
    table, and its effective activity is older than `idle_days`.
-4. No pane in the tab has agent status `working`.
-5. The tab is not the focused tab.
+4. No agent pane's session value is also open in some other tab (see below).
+5. No pane in the tab has agent status `working`.
+6. The tab is not the focused tab.
 
 Blocked agents are treated like any other: blocked with no activity for
 `idle_days` is archived. Shell panes inside an eligible tab are archived with it
 and come back as shells in their working directory.
+
+**Duplicate conversations.** The same session id can be open in two tabs at
+once (for example the same `claude --resume <id>` run twice, or a session
+resumed by hand into a second tab while the first is still open). Archiving
+either one, or restoring an archive back into a tab while the same
+conversation is already open elsewhere, would leave the two tabs pointing at
+one conversation, so both are left alone instead: a sweep builds a map from
+session key to the set of `tab_id`s an agent pane carries that session in,
+and a tab whose session is open in any other tab is skipped with
+`"<pane>: conversation <id prefix> is also open in another tab"`. Restoring
+an archive checks the same thing against currently live panes (see Restore
+flow) and refuses rather than duplicating the conversation.
 
 Anything uncertain makes the tab ineligible for that sweep, for example a failed
 `pane.process_info`.
@@ -236,6 +277,10 @@ on = "pane.agent_status_changed"
 command = ["python3", "-m", "shelf", "track"]
 
 [[events]]
+on = "pane.agent_detected"
+command = ["python3", "-m", "shelf", "track"]
+
+[[events]]
 on = "workspace.focused"
 command = ["python3", "-m", "shelf", "sweep", "--if-due"]
 
@@ -267,6 +312,10 @@ herdr's `emit_focus_api_events` (`src/app/api.rs`) fires `workspace.focused`,
 `tab.focused` and `pane.focused` together for every focus change, so
 subscribing to more than one of them would only spawn the sweep hook process
 multiple times per focus change without adding any coverage.
+
+The `pane.agent_detected` hook runs the same `track` command as
+`pane.agent_status_changed`; `track` tells them apart by the event's own
+`event` field.
 
 ## Configuration
 
@@ -305,11 +354,13 @@ invalid top-level value.
 Under `HERDR_PLUGIN_STATE_DIR`:
 
 ```
-activity.json                        {"<agent>:<session>": {"first_seen", "last_active", "restored_at", "last_status"}}
+activity.json                        {"<agent>:<session>": {"first_seen", "last_active", "restored_at", "last_status"},
+                                       "terminals": {"<terminal_id>": {"agent_started_at"}}}
 activity.lock                        held while activity.json is read and rewritten
 archive/<archive-id>/record.json
 archive/<archive-id>/sessions/...    copies of Claude session files and directories
 installed_at                         ISO time of the first sweep ever run
+server_started_at                    ISO time of herdr's own most recent startup
 last_sweep                           ISO time of the last completed sweep
 sweep.lock                           held for the duration of a sweep, a restore, or a picker delete
 config-error.lock                    held while a broken config.json is reported
@@ -322,6 +373,23 @@ shelf.log.1                          shelf.log rotated out once it passes 1MB
 the last `agent_status` recorded for that session, used to tell a real status
 change (which counts, for `blocked` and `done`) from herdr re-firing the same
 status because only a pane's title or labels changed.
+
+`"terminals"` is a reserved top-level key in `activity.json`, holding per-pane
+data keyed by `terminal_id` rather than by session -- currently just
+`agent_started_at`, set by `track` on a `pane.agent_detected` event (see
+Activity signal). Every other top-level key is a `<agent>:<session>` session
+record; any code that iterates `activity.json` (the sweep's own eligibility
+pass, archiving, restoring) must skip this one rather than treat it as a
+session. A sweep prunes `"terminals"` down to the terminal ids it actually
+saw in that sweep's `pane.list`, so an entry for a pane that is long gone does
+not sit in the file forever.
+
+`server_started_at` is written by `__main__` whenever it runs with
+`HERDR_PLUGIN_EVENT=startup` (herdr's startup hook), before anything else --
+in particular before the sweep hook's own due check -- so it is available
+even on a startup sweep that turns out not to be due. `track` reads it to
+decide whether a `pane.agent_detected` event falls in the startup grace
+period (see Activity signal).
 
 `activity.json` is updated under a lock with write-to-temp-and-rename, because
 `track` and `sweep` can run at the same time. `track` skips the write when the
@@ -362,9 +430,14 @@ not removed.
 
 ## Flows
 
-### Track (`track`, on `pane.agent_status_changed`)
+### Track (`track`, on `pane.agent_status_changed` or `pane.agent_detected`)
 
-1. Read `pane_id` and `agent_status` from `HERDR_PLUGIN_EVENT_JSON`.
+`track` reads the event's own `event` field from `HERDR_PLUGIN_EVENT_JSON` to
+tell the two apart; both hooks run the same `python3 -m shelf track` command.
+
+For `pane.agent_status_changed`:
+
+1. Read `pane_id` and `agent_status` from the event data.
 2. If the status is not `working`, `blocked` or `done`, exit.
 3. `pane.get` for the pane's `agent_session`. If there is none, exit.
 4. Record "active now" for `<agent>:<session value>`, subject to the 60-second
@@ -375,6 +448,18 @@ not removed.
    a following `done` with the same status as the one already on record is
    not counted either.
 
+For `pane.agent_detected`:
+
+1. Read `pane_id`, `agent` and `released` from the event data. If `agent` is
+   empty or `released` is true, exit -- this event also fires when a pane's
+   agent is released, and that is not a start.
+2. `pane.get` for the pane's `terminal_id`. If there is none, exit.
+3. If `server_started_at` is set and less than `STARTUP_GRACE` (10 minutes)
+   before now, exit: this is herdr's own resume of a pane it restored itself,
+   not the user or an agent (re)starting one.
+4. Otherwise record `terminals.<terminal_id>.agent_started_at = now` (see
+   State directory layout).
+
 ### Sweep (`sweep --if-due`)
 
 1. Exit if `last_sweep` is newer than `sweep_interval_minutes`. `sweep` without
@@ -384,16 +469,21 @@ not removed.
    gap between the first check and acquiring the lock.
 2. List tabs and panes. For each pane read `agent_session` and agent status;
    record `first_seen` for new sessions and "active now" for panes that are
-   `working`; compute effective activity.
-3. Select eligible tabs.
+   `working`; prune `terminals` entries for terminal ids not seen in this
+   list; compute effective activity, including each pane's own
+   `agent_started_at`. Also build the session-key -> set-of-`tab_id`s map used
+   for the duplicate-conversation check.
+3. Select eligible tabs (see Eligibility, including the duplicate-conversation
+   check).
 4. In `dry-run`, log each eligible tab and show one notification, for example
    `shelf (dry-run): would archive 3 tabs: fix-retries, docs-pass, perf-probe`.
 5. In `live`, archive each eligible tab, then show one summary notification.
    herdr compacts ids when a tab closes, so before archiving each tab the sweep
-   lists tabs again, finds the tab by its panes' `terminal_id`s, and re-checks
-   eligibility on that fresh data. A single tab's failure (herdr error,
-   filesystem error, or anything unexpected) is logged with its traceback and
-   reported as failed; it never aborts the rest of the sweep.
+   lists tabs again, finds the tab by its panes' `terminal_id`s, rebuilds the
+   duplicate-conversation map from that fresh list, and re-checks eligibility
+   on that fresh data. A single tab's failure (herdr error, filesystem error,
+   or anything unexpected) is logged with its traceback and reported as
+   failed; it never aborts the rest of the sweep.
 6. Show the summary notification in a `finally`, so it happens even if
    something above raised partway through, and exactly once. `last_sweep` is
    written in that same `finally`, but only when the initial gather (tab.list
@@ -466,7 +556,16 @@ rather than restoring a stale copy.
    to its original path. A pane whose saved cwd no longer exists on disk adds a
    warning ("... no longer exists; the pane opens in herdr's fallback
    directory") rather than failing the restore.
-3. Build the `layout.apply` tree from the saved layout. Each agent pane's
+3. Before building anything or calling `workspace.create`: `pane.list` for every
+   currently live pane. If any live pane's `agent_session.value` equals one of
+   this record's own session values, the conversation is already open in
+   another tab; raise `Skip("conversation <id prefix> is already open in
+   another tab; close it first")` and leave the archive entry untouched. This
+   is the same duplicate-conversation rule sweep applies (see Eligibility),
+   checked again here because the tab could have been reopened by hand (or by
+   a second restore of a session shared between two archive entries) since the
+   archive entry was written.
+4. Build the `layout.apply` tree from the saved layout. Each agent pane's
    `command` becomes
    `["sh", "-c", "trap : INT; <relaunch argv>; exec \"${SHELL:-sh}\""]`, with every
    argument shell-quoted. The relaunch argv is the saved launch argv with the agent's
@@ -475,7 +574,7 @@ rather than restoring a stale copy.
    shell itself, so a Ctrl-C aimed at the agent does not kill the pane before the
    fallback shell can start. The shell wrapper leaves a usable shell when the agent
    exits. Shell panes get no command and start a shell in their cwd.
-4. Apply with the saved tab label and `focus: true`. `layout.apply` rejects a
+5. Apply with the saved tab label and `focus: true`. `layout.apply` rejects a
    request that carries both `tab_id` and `workspace_id`, so when step 1 created
    a new workspace, only its first tab's `tab_id` is sent (never `workspace_id`
    too); when an existing workspace was found, only `workspace_id` is sent. If
@@ -483,7 +582,7 @@ rather than restoring a stale copy.
    workspace is closed (best effort; a failure to close it is logged, not
    raised) before the original error is re-raised, so a failed restore does not
    leave a stray empty workspace behind.
-5. Set `restored_at` for each restored session, then delete the archive entry.
+6. Set `restored_at` for each restored session, then delete the archive entry.
    A failure while recording `restored_at` is logged but never keeps the
    entry: once `layout.apply` has succeeded, the tab is live and the archive
    entry must not linger just because bookkeeping afterward had a problem.
@@ -529,15 +628,24 @@ Standard library `unittest`, run in CI on Ubuntu and macOS with Python 3.9 and
   aliases, the `letta` special case, `relaunch: plain`, and config overrides.
 - Quoting of arguments that contain spaces and quotes in the `sh -c` wrapper.
 - Tracking: which statuses record activity, the 60-second skip, and `first_seen`.
+- `pane.agent_detected` tracking: a start records `agent_started_at` for the
+  pane's terminal; a released event or a missing agent is ignored; nothing is
+  recorded inside the startup grace period.
 - History sources against fixture files, including Claude files whose tail is only
   bookkeeping entries, and meta and sidechain entries that must be skipped.
 - Effective activity: each combination of generic, history, `first_seen` and
   `restored_at`.
 - Eligibility as a table of cases: working, blocked, focused, no session, agent not
-  in the table, shell-only tab, recently restored, mixed agent and shell panes.
+  in the table, shell-only tab, recently restored, mixed agent and shell panes,
+  a duplicate conversation open in another tab.
+- A sweep where a session's own history/first_seen is well past `idle_days` but
+  its pane's terminal has a recent `agent_started_at`: not eligible. A sweep
+  with two tabs sharing one session: neither archived. Terminal entries for
+  vanished terminals are pruned.
 - Archive and restore against a fake herdr socket server that records requests.
   Tests check the `layout.apply` payload and the call order, including that the
-  record is written before `tab.close`.
+  record is written before `tab.close`, and that a restore whose conversation
+  is already open in a live pane raises and keeps the archive entry.
 - Config parsing, including unknown keys and malformed JSON.
 
 Before each release: compare the agent table with the current herdr

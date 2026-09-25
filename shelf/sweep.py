@@ -13,8 +13,15 @@ from .util import FileLock, LockBusy, iso, now as utc_now, parse_iso
 log = logging.getLogger("shelf")
 
 
-def decide(tab: dict, panes: list, table: dict, activity_of, idle: timedelta, now: datetime):
-    """None when the tab should be archived, otherwise the reason it should not."""
+def decide(tab: dict, panes: list, table: dict, activity_of, idle: timedelta, now: datetime,
+           open_in: dict | None = None):
+    """None when the tab should be archived, otherwise the reason it should not.
+
+    open_in, when given, maps a session key to the set of tab_ids it is open
+    in across the whole sweep; a session open in some tab_id other than this
+    tab's own is never archived, so the same conversation cannot end up open
+    in two tabs at once. None (the default) skips that check entirely.
+    """
     if tab.get("focused"):
         return "focused"
     if any(p.get("agent_status") == "working" for p in panes):
@@ -35,12 +42,32 @@ def decide(tab: dict, panes: list, table: dict, activity_of, idle: timedelta, no
             return f"{p['pane_id']}: agent {session.get('agent')!r} is not in the agent table"
         if not agents.valid_session_value(session["agent"], session["value"]):
             return f"{p['pane_id']}: invalid session id"
-        last = activity_of(session["agent"], session["value"])
+        if open_in is not None:
+            key = activity.session_key(session["agent"], session["value"])
+            other_tabs = open_in.get(key, set()) - {tab.get("tab_id")}
+            if other_tabs:
+                return f"{p['pane_id']}: conversation {session['value'][:8]} is also open in another tab"
+        last = activity_of(session["agent"], session["value"], p.get("terminal_id"))
         if last is None:
             return f"{p['pane_id']}: activity unknown"
         if now - last < idle:
             return f"{p['pane_id']}: active {(now - last).days}d ago"
     return None
+
+
+def _open_sessions(tabs: list) -> dict:
+    """Session key -> set of tab_ids an agent pane carries that session in,
+    across the whole sweep, so decide() can refuse to archive a conversation
+    that is open in more than one tab."""
+    result: dict = {}
+    for tab, panes in tabs:
+        for p in panes:
+            session = p.get("agent_session")
+            if not p.get("agent") or not session or not session.get("value"):
+                continue
+            key = activity.session_key(session.get("agent"), session["value"])
+            result.setdefault(key, set()).add(tab.get("tab_id"))
+    return result
 
 
 def gather(client) -> list:
@@ -60,8 +87,19 @@ def _find(tabs: list, terminals: frozenset):
 
 
 def _record_presence(data: dict, tabs: list, now: datetime) -> bool:
-    """first_seen for every agent session; active-now only for working panes."""
+    """first_seen for every agent session; active-now only for working panes.
+
+    Also prunes data["terminals"] down to terminal ids seen in this gather,
+    so a terminal_id recorded by track() (pane.agent_detected) does not stick
+    around forever once its pane is gone.
+    """
     changed = False
+    current_terminals = {p["terminal_id"] for _, panes in tabs for p in panes if p.get("terminal_id")}
+    terminals = data.get(activity.TERMINALS_KEY)
+    if isinstance(terminals, dict):
+        for terminal_id in [t for t in terminals if t not in current_terminals]:
+            del terminals[terminal_id]
+            changed = True
     for _, panes in tabs:
         for p in panes:
             session = p.get("agent_session")
@@ -86,13 +124,20 @@ def _record_presence(data: dict, tabs: list, now: datetime) -> bool:
 
 def _activity_lookup(records: dict, installed_at: datetime | None):
     cache = {}
+    terminals = records.get(activity.TERMINALS_KEY)
+    terminals = terminals if isinstance(terminals, dict) else {}
 
-    def activity_of(agent: str, value: str):
+    def activity_of(agent: str, value: str, terminal_id: str | None = None):
         key = activity.session_key(agent, value)
         if key not in cache:
             cache[key] = activity.effective(records.get(key, {}), history.last_activity(agent, value),
                                              installed_at)
-        return cache[key]
+        session_activity = cache[key]
+        started = None
+        if terminal_id:
+            started = parse_iso((terminals.get(terminal_id) or {}).get("agent_started_at"))
+        candidates = [c for c in (session_activity, started) if c is not None]
+        return max(candidates) if candidates else None
 
     return activity_of
 
@@ -234,11 +279,12 @@ def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime, report: d
     store = activity.ActivityStore(state)
     store.update(lambda d: _record_presence(d, tabs, now))
     activity_of = _activity_lookup(store.load(), installed_at)
+    open_in = _open_sessions(tabs)
     idle = timedelta(days=cfg["idle_days"])
     targets = []
     for tab, panes in tabs:
         label = _display_label(tab, workspace_labels)
-        reason = decide(tab, panes, table, activity_of, idle, now)
+        reason = decide(tab, panes, table, activity_of, idle, now, open_in)
         if reason:
             _skip(report, label, reason)
             continue
@@ -256,12 +302,13 @@ def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime, report: d
             # archive_tab below) must be reported as this target's failure
             # and must not abort the rest of the sweep.
             activity_of = _activity_lookup(store.load(), installed_at)  # a track hook may have fired meanwhile
-            found = _find(gather(client), terminals)
+            fresh_tabs = gather(client)
+            found = _find(fresh_tabs, terminals)
             if found is None:
                 _skip(report, label, "tab changed during the sweep")
                 continue
             tab, panes = found
-            reason = decide(tab, panes, table, activity_of, idle, now)
+            reason = decide(tab, panes, table, activity_of, idle, now, _open_sessions(fresh_tabs))
             if reason:
                 _skip(report, label, reason)
                 continue

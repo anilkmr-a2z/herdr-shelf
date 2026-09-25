@@ -52,7 +52,7 @@ class CaptureTest(unittest.TestCase):
         session.write_text('{"type":"user","timestamp":"2026-09-10T00:00:00Z"}\n')
         (self.claude / "projects" / "-src-api" / "S1").mkdir()
         self.table = agents.table()
-        self.activity_of = lambda agent, value: datetime(2026, 9, 10, tzinfo=timezone.utc)
+        self.activity_of = lambda agent, value, terminal_id=None: datetime(2026, 9, 10, tzinfo=timezone.utc)
 
     def test_record_contents(self):
         fake = fake_herdr(self)
@@ -205,7 +205,7 @@ class ArchiveTabTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.arch = archive.Archive(Path(self.tmp.name) / "state")
         self.table = agents.table()
-        self.activity_of = lambda agent, value: None
+        self.activity_of = lambda agent, value, terminal_id=None: None
 
     def test_record_written_before_close(self):
         fake = fake_herdr(self)

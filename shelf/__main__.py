@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import activity, agents, archive, config, picker, restore, sweep
 from .api import Client, HerdrError
-from .util import FileLock, LockBusy, now
+from .util import FileLock, LockBusy, iso, now
 
 PLUGIN_ID = "shelf"
 ALWAYS_HOOKS = ("track", "open-picker")
@@ -118,6 +118,20 @@ def _describe(rec: dict, moment) -> str:
     return "  ".join(parts)
 
 
+def _record_server_started(state: Path, moment) -> None:
+    """herdr's startup hook fires with HERDR_PLUGIN_EVENT=startup; record when
+    that happened so track() can tell herdr's own resume of a restored pane
+    (right after this moment) apart from the user (re)starting an agent later.
+    """
+    if os.environ.get("HERDR_PLUGIN_EVENT") != "startup":
+        return
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "server_started_at").write_text(iso(moment) + "\n")
+    except OSError:
+        pass
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     command = argv[0] if argv else ""
@@ -126,6 +140,10 @@ def main(argv=None) -> int:
     is_hook = _is_hook(command, args)
     try:
         _setup_logging(state)
+        # Before any due check or early return: a startup hook invocation
+        # (e.g. "sweep --if-due") must record this even when the sweep itself
+        # turns out not to be due.
+        _record_server_started(state, now())
         return _dispatch(command, args, state)
     except config.ConfigError as e:
         log.error("%s: %s", command or "shelf", e)

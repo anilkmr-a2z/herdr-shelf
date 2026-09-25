@@ -221,7 +221,7 @@ def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_trans
         session = pane.get("agent_session")
         if pane.get("agent") and session and session.get("agent") in table:
             agent = session["agent"]
-            last = activity_of(agent, session["value"])
+            last = activity_of(agent, session["value"], pane.get("terminal_id"))
             launch_argv = _launch_argv(client, pane["pane_id"], table[agent])
             meta.update({
                 "agent": agent,

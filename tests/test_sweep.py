@@ -26,10 +26,10 @@ def pane(pane_id, agent="claude", status="idle", session="S", tab="w1:t1"):
 class DecideTest(unittest.TestCase):
     table = agents.table()
 
-    def decide(self, panes, focused=False, days_ago=10):
+    def decide(self, panes, focused=False, days_ago=10, open_in=None):
         tab = {"tab_id": "w1:t1", "focused": focused}
-        activity_of = lambda a, v: None if days_ago is None else T0 - timedelta(days=days_ago)
-        return sweep.decide(tab, panes, self.table, activity_of, IDLE, T0)
+        activity_of = lambda a, v, terminal_id=None: None if days_ago is None else T0 - timedelta(days=days_ago)
+        return sweep.decide(tab, panes, self.table, activity_of, IDLE, T0, open_in=open_in)
 
     def test_cases(self):
         cases = [
@@ -62,6 +62,31 @@ class DecideTest(unittest.TestCase):
         p["agent"] = "codex"
         reason = self.decide([p])
         self.assertIn("agent does not match its session", reason)
+
+    def test_terminal_id_is_forwarded_to_activity_of(self):
+        seen = {}
+
+        def activity_of(agent, value, terminal_id=None):
+            seen["terminal_id"] = terminal_id
+            return T0 - timedelta(days=10)
+
+        tab = {"tab_id": "w1:t1", "focused": False}
+        reason = sweep.decide(tab, [pane("p1")], self.table, activity_of, IDLE, T0)
+        self.assertIsNone(reason)
+        self.assertEqual(seen["terminal_id"], "term_p1")
+
+    def test_duplicate_conversation_open_in_another_tab_is_not_eligible(self):
+        reason = self.decide([pane("p1", session="S")], open_in={"claude:S": {"w1:t1", "w1:t9"}})
+        self.assertIn("also open in another tab", reason)
+        self.assertIn("S"[:8], reason)
+
+    def test_conversation_only_in_its_own_tab_is_eligible(self):
+        reason = self.decide([pane("p1", session="S")], open_in={"claude:S": {"w1:t1"}})
+        self.assertIsNone(reason)
+
+    def test_open_in_defaulting_to_none_keeps_old_behavior(self):
+        reason = self.decide([pane("p1", session="S")])
+        self.assertIsNone(reason)
 
 
 class RunTest(unittest.TestCase):
@@ -325,6 +350,36 @@ class RunTest(unittest.TestCase):
         report = self.run_sweep()
         self.assertIn("main/w1:t3", report["eligible"])
 
+    def test_recent_agent_start_on_the_terminal_keeps_an_old_session_ineligible(self):
+        # claude:OLD's own history/first_seen is over idle_days old (as in
+        # test_live_archives), but the pane's terminal shows an agent started
+        # 20 minutes ago (a hand resume, or herdr restarting the agent):
+        # that must count as activity for the tab as a whole.
+        session_file = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / "-src" / "OLD.jsonl"
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        session_file.write_text(json.dumps({"type": "user", "timestamp": iso(T0 - timedelta(days=31))}) + "\n")
+        terminal_id = self.panes[0]["terminal_id"]
+
+        def set_started(d):
+            d.setdefault("terminals", {})[terminal_id] = {"agent_started_at": iso(T0 - timedelta(minutes=20))}
+            return True
+
+        activity.ActivityStore(self.state).update(set_started)
+        report = self.run_sweep()
+        self.assertNotIn("old", report["eligible"])
+        reasons = dict(report["skipped"])
+        self.assertIn("active 0d ago", reasons["old"])
+
+    def test_two_tabs_sharing_one_session_are_both_left_alone(self):
+        self.tabs.append({"tab_id": "w1:t3", "workspace_id": "w1", "label": "dup", "focused": False})
+        self.panes.append(pane("w1:p3", session="OLD", tab="w1:t3"))
+        report = self.run_sweep()
+        self.assertNotIn("old", report["eligible"])
+        self.assertNotIn("dup", report["eligible"])
+        reasons = dict(report["skipped"])
+        self.assertIn("also open in another tab", reasons["old"])
+        self.assertIn("also open in another tab", reasons["dup"])
+
 
 class RecordPresenceTest(unittest.TestCase):
     def test_working_pane_sets_last_status_so_a_later_done_event_counts(self):
@@ -336,6 +391,20 @@ class RecordPresenceTest(unittest.TestCase):
         sweep._record_presence(data, tabs, T0)
         self.assertEqual(data["claude:S"]["last_status"], "working")
         self.assertTrue(activity.record_status(data, "claude:S", "done", T0 + timedelta(minutes=5)))
+
+    def test_terminal_entries_for_vanished_terminals_are_pruned(self):
+        data = {"terminals": {"term_gone": {"agent_started_at": "2026-09-01T00:00:00Z"},
+                               "term_p1": {"agent_started_at": "2026-09-20T00:00:00Z"}}}
+        tabs = [({}, [pane("p1", session="S")])]  # only "term_p1" is still present
+        self.assertTrue(sweep._record_presence(data, tabs, T0))
+        self.assertNotIn("term_gone", data["terminals"])
+        self.assertIn("term_p1", data["terminals"])
+
+    def test_no_terminals_key_is_untouched_when_nothing_vanished(self):
+        data = {}
+        tabs = [({}, [pane("p1", session="S")])]
+        sweep._record_presence(data, tabs, T0)
+        self.assertNotIn("terminals", data)
 
 
 class InstalledAtEligibilityTest(unittest.TestCase):
