@@ -13,11 +13,6 @@ from .util import FileLock, atomic_write_json, iso, parse_iso, read_json
 ACTIVE_STATUSES = frozenset({"working", "blocked", "done"})
 TOUCH_SKIP = timedelta(seconds=60)
 
-# How long after herdr's own startup a pane.agent_detected event is assumed to
-# be herdr resuming a pane it restored itself, rather than the user (re)starting
-# an agent by hand -- so that resume must not count as activity.
-STARTUP_GRACE = timedelta(minutes=10)
-
 # Reserved top-level key in activity.json for per-terminal data (currently
 # just agent_started_at). Every other top-level key is a "<agent>:<value>"
 # session record; code that iterates activity.json must skip this one.
@@ -99,7 +94,15 @@ def mark_restored(data: dict, key: str, now: datetime) -> bool:
 
 
 def effective(rec: dict, history_ts: datetime | None, installed_at: datetime | None = None) -> datetime | None:
-    """Latest of last_active, restored_at, and either history or first_seen.
+    """Latest of last_active, restored_at, agent_started_at, and either
+    history or first_seen.
+
+    agent_started_at (set by track() on a pane.agent_detected event, and by a
+    sweep's _record_presence copying it over from the pane's terminal, so it
+    survives a herdr restart that changes terminal ids -- see sweep.py)
+    always counts, the same as last_active and restored_at: starting or
+    resuming an agent is activity regardless of what a history source or
+    first_seen says.
 
     When a history source has a timestamp, first_seen only counts in
     addition to it when it is strictly later than installed_at -- a session
@@ -110,7 +113,8 @@ def effective(rec: dict, history_ts: datetime | None, installed_at: datetime | N
     to decide. Without installed_at (unknown), first_seen is not counted
     alongside history, matching that same "seen at install" behavior.
     """
-    candidates = [parse_iso(rec.get("last_active")), parse_iso(rec.get("restored_at"))]
+    candidates = [parse_iso(rec.get("last_active")), parse_iso(rec.get("restored_at")),
+                  parse_iso(rec.get("agent_started_at"))]
     first_seen = parse_iso(rec.get("first_seen"))
     if history_ts is not None:
         candidates.append(history_ts)
@@ -122,32 +126,41 @@ def effective(rec: dict, history_ts: datetime | None, installed_at: datetime | N
     return max(present) if present else None
 
 
-def _server_started_at(state_dir) -> datetime | None:
-    try:
-        text = (Path(state_dir) / "server_started_at").read_text().strip()
-    except FileNotFoundError:
-        return None
-    return parse_iso(text)
-
-
-def _in_startup_grace(state_dir, now: datetime) -> bool:
-    started = _server_started_at(state_dir)
-    return started is not None and now - started < STARTUP_GRACE
+def _terminals_dict(data: dict) -> dict:
+    """data["terminals"], resetting a present-but-invalid value (anything
+    other than a dict) to {} rather than letting a corrupt or unexpected
+    value crash a later write."""
+    terminals = data.get(TERMINALS_KEY)
+    if not isinstance(terminals, dict):
+        terminals = {}
+        data[TERMINALS_KEY] = terminals
+    return terminals
 
 
 def record_terminal_started(data: dict, terminal_id: str, now: datetime) -> bool:
     """Record that an agent (re)started in this pane's terminal, keyed by
     terminal_id rather than session, so a resume with no user or assistant
-    message still counts as activity."""
-    data.setdefault(TERMINALS_KEY, {})[terminal_id] = {"agent_started_at": iso(now)}
+    message still counts as activity. A sweep's _record_presence later
+    copies this into the session's own record too, so it survives a herdr
+    restart that assigns the pane a new terminal_id (see sweep.py)."""
+    _terminals_dict(data)[terminal_id] = {"agent_started_at": iso(now)}
+    return True
+
+
+def _mark_session_started(rec: dict, now: datetime) -> bool:
+    existing = parse_iso(rec.get("agent_started_at"))
+    if existing is not None and existing >= now:
+        return False
+    rec["agent_started_at"] = iso(now)
     return True
 
 
 def _track_agent_detected(client, store: ActivityStore, data: dict, pane_id: str, now: datetime) -> bool:
     """Handle one pane.agent_detected event: a truthy agent that was not
     released means an agent is now running in this pane (started or
-    restarted). herdr's own resume of a restored pane, right after herdr
-    itself starts, must not count -- that is the startup grace period.
+    restarted, including a conversation resumed by hand). herdr omits
+    "released" entirely when it is false, and omits "agent" on a release, so
+    a release never looks like a start.
     """
     if not data.get("agent") or data.get("released"):
         return False
@@ -155,13 +168,44 @@ def _track_agent_detected(client, store: ActivityStore, data: dict, pane_id: str
     terminal_id = pane.get("terminal_id")
     if not terminal_id:
         return False
-    if _in_startup_grace(store.path.parent, now):
-        return False
-    return store.update(lambda d: record_terminal_started(d, terminal_id, now))
+    session = pane.get("agent_session")
+    key = None
+    if isinstance(session, dict) and session.get("agent") and session.get("value"):
+        key = session_key(session["agent"], session["value"])
+
+    def apply(d: dict) -> bool:
+        changed = record_terminal_started(d, terminal_id, now)
+        if key is not None:
+            changed = _mark_session_started(d.setdefault(key, {}), now) or changed
+        return changed
+
+    return store.update(apply)
 
 
-def track(client, store: ActivityStore, event_json: str | None, env_pane_id: str | None, now: datetime) -> bool:
+def _is_agent_detected_event(env_event: str | None, json_event, data: dict) -> bool:
+    """Tell a pane.agent_detected event apart from pane.agent_status_changed.
+
+    herdr's HERDR_PLUGIN_EVENT (the hook's own dot-form event name) is
+    "pane.agent_detected" for this hook. The event *payload* itself
+    (HERDR_PLUGIN_EVENT_JSON) uses herdr's snake_case EventKind names instead
+    -- its own "event" field, and the "type" field inside "data", are both
+    "pane_agent_detected" -- so all three are checked; any one matching is
+    enough.
+    """
+    if env_event == "pane.agent_detected":
+        return True
+    if json_event in ("pane_agent_detected", "pane.agent_detected"):
+        return True
+    return data.get("type") == "pane_agent_detected"
+
+
+def track(client, store: ActivityStore, event_json: str | None, env_pane_id: str | None, now: datetime,
+          env_event: str | None = None) -> bool:
     """Handle one pane.agent_status_changed or pane.agent_detected event.
+
+    env_event is HERDR_PLUGIN_EVENT (the hook's own event name, in dot form);
+    see _is_agent_detected_event for why the event JSON payload alone is not
+    always enough to tell the two events apart.
 
     Returns whether activity.json was actually changed as a result.
     """
@@ -177,7 +221,7 @@ def track(client, store: ActivityStore, event_json: str | None, env_pane_id: str
     pane_id = data.get("pane_id") or env_pane_id
     if not pane_id:
         return False
-    if parsed.get("event") == "pane.agent_detected":
+    if _is_agent_detected_event(env_event, parsed.get("event"), data):
         return _track_agent_detected(client, store, data, pane_id, now)
     status = data.get("agent_status")
     if status not in ACTIVE_STATUSES:

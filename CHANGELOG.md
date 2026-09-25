@@ -5,12 +5,15 @@
 - Fix: starting or resuming an agent in a pane now counts as activity (a new
   `pane.agent_detected` hook), so a conversation resumed by hand no longer
   looks idle just because starting it sent no user or assistant message.
-  Herdr's own resume of a pane it restored itself, right after herdr starts,
-  does not count -- a 10-minute startup grace period.
+  This survives herdr restarting (which assigns the pane a new terminal id):
+  it is remembered against the session itself, not just the pane.
 - Fix: a conversation open in two tabs at once is no longer archived or
   restored twice. A sweep leaves both tabs alone when the same session is
-  open in more than one of them, and restore refuses (keeping the archive
-  entry) when the conversation is already open in a live pane.
+  open in more than one of them (including two panes of one tab), rechecking
+  right before it would close either one, and restore refuses (keeping the
+  archive entry) when the conversation is already open in a live pane. A
+  manual `archive <tab-id>` still proceeds in this case, with a warning,
+  since it targets one tab explicitly.
 
 ## 0.2.0 - 2026-09-25
 

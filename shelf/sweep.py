@@ -29,6 +29,7 @@ def decide(tab: dict, panes: list, table: dict, activity_of, idle: timedelta, no
     agent_panes = [p for p in panes if p.get("agent")]
     if not agent_panes:
         return "no agent pane"
+    seen_keys = set()
     for p in agent_panes:
         session = p.get("agent_session")
         if not session or not session.get("value"):
@@ -42,8 +43,14 @@ def decide(tab: dict, panes: list, table: dict, activity_of, idle: timedelta, no
             return f"{p['pane_id']}: agent {session.get('agent')!r} is not in the agent table"
         if not agents.valid_session_value(session["agent"], session["value"]):
             return f"{p['pane_id']}: invalid session id"
+        key = activity.session_key(session["agent"], session["value"])
+        if key in seen_keys:
+            # Two panes of this same tab carrying the same conversation:
+            # open_in (keyed by tab_id) never catches this on its own, since
+            # both panes belong to this one tab.
+            return f"{p['pane_id']}: conversation {session['value'][:8]} is also open in another pane"
+        seen_keys.add(key)
         if open_in is not None:
-            key = activity.session_key(session["agent"], session["value"])
             other_tabs = open_in.get(key, set()) - {tab.get("tab_id")}
             if other_tabs:
                 return f"{p['pane_id']}: conversation {session['value'][:8]} is also open in another tab"
@@ -89,17 +96,57 @@ def _find(tabs: list, terminals: frozenset):
 def _record_presence(data: dict, tabs: list, now: datetime) -> bool:
     """first_seen for every agent session; active-now only for working panes.
 
-    Also prunes data["terminals"] down to terminal ids seen in this gather,
-    so a terminal_id recorded by track() (pane.agent_detected) does not stick
-    around forever once its pane is gone.
+    Also copies each present agent pane's terminal-recorded agent_started_at
+    onto its own session record (keeping the max), so it survives a herdr
+    restart, which assigns the pane a new terminal_id and would otherwise
+    strand the only copy under a terminal id that is about to be pruned; and
+    prunes data["terminals"] down to terminal ids seen in this gather, so a
+    terminal_id recorded by track() (pane.agent_detected) does not stick
+    around forever once its pane is gone. A terminal entry started at or
+    after this sweep's own "now" is kept even if it is not in this gather --
+    a concurrent track() call can record a pane that appeared after this
+    sweep's tabs were listed, and that must not be pruned just because it
+    postdates the snapshot being processed here.
     """
     changed = False
+    raw_terminals = data.get(activity.TERMINALS_KEY)
+    if raw_terminals is None:
+        terminals: dict = {}
+    elif isinstance(raw_terminals, dict):
+        terminals = raw_terminals
+    else:
+        data[activity.TERMINALS_KEY] = {}
+        terminals = data[activity.TERMINALS_KEY]
+        changed = True
+
     current_terminals = {p["terminal_id"] for _, panes in tabs for p in panes if p.get("terminal_id")}
-    terminals = data.get(activity.TERMINALS_KEY)
-    if isinstance(terminals, dict):
-        for terminal_id in [t for t in terminals if t not in current_terminals]:
-            del terminals[terminal_id]
-            changed = True
+
+    for _, panes in tabs:
+        for p in panes:
+            terminal_id = p.get("terminal_id")
+            entry = terminals.get(terminal_id) if terminal_id else None
+            if not isinstance(entry, dict):
+                continue
+            started = parse_iso(entry.get("agent_started_at"))
+            session = p.get("agent_session")
+            if started is None or not isinstance(session, dict) or not session.get("agent") \
+                    or not session.get("value"):
+                continue
+            key = activity.session_key(session["agent"], session["value"])
+            rec = data.setdefault(key, {})
+            existing = parse_iso(rec.get("agent_started_at"))
+            if existing is None or started > existing:
+                rec["agent_started_at"] = entry["agent_started_at"]
+                changed = True
+
+    for terminal_id in [t for t in terminals if t not in current_terminals]:
+        entry = terminals.get(terminal_id)
+        started = parse_iso(entry.get("agent_started_at")) if isinstance(entry, dict) else None
+        if started is not None and started >= now:
+            continue  # possibly a concurrent write racing with this sweep's own gather
+        del terminals[terminal_id]
+        changed = True
+
     for _, panes in tabs:
         for p in panes:
             session = p.get("agent_session")
@@ -135,7 +182,9 @@ def _activity_lookup(records: dict, installed_at: datetime | None):
         session_activity = cache[key]
         started = None
         if terminal_id:
-            started = parse_iso((terminals.get(terminal_id) or {}).get("agent_started_at"))
+            entry = terminals.get(terminal_id)
+            if isinstance(entry, dict):
+                started = parse_iso(entry.get("agent_started_at"))
         candidates = [c for c in (session_activity, started) if c is not None]
         return max(candidates) if candidates else None
 
@@ -332,6 +381,22 @@ def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime, report: d
 ARCHIVE_NOW_LOCK_WAIT_SECONDS = 10.0
 
 
+def _warn_if_open_elsewhere(tab_id: str, panes: list, open_in: dict) -> None:
+    """Manual archive proceeds even when the conversation is open elsewhere
+    (unlike a sweep, which leaves both tabs alone) -- it is an explicit,
+    single-tab action -- but warns, since restoring the resulting archive
+    entry later will refuse while the other copy is still open."""
+    for p in panes:
+        if not p.get("agent"):
+            continue
+        session = p.get("agent_session")
+        if not session or not session.get("value"):
+            continue
+        key = activity.session_key(session.get("agent"), session["value"])
+        if open_in.get(key, set()) - {tab_id}:
+            log.warning("%s: conversation %s is also open in another tab", tab_id, session["value"][:8])
+
+
 def archive_now(client, cfg: dict, state_dir, table: dict, tab_id: str, now: datetime | None = None) -> str:
     """Archive one tab immediately, ignoring idle_days and mode."""
     now = now or utc_now()
@@ -349,5 +414,6 @@ def archive_now(client, cfg: dict, state_dir, table: dict, tab_id: str, now: dat
         reason = decide(tab, panes, table, activity_of, timedelta(0), now)
         if reason:
             raise archive.Skip(reason)
+        _warn_if_open_elsewhere(tab_id, panes, _open_sessions(tabs))
         return archive.archive_tab(client, archive.Archive(state), tab, panes, table, activity_of,
                                    cfg["keep_transcripts"], now)

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from shelf import agents, archive
+from shelf import agents, archive, sweep
 from shelf.api import Client, HerdrError
 from tests.fakeherdr import FakeError, FakeHerdr
 
@@ -68,6 +68,17 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(record["session_copies"], ["projects/-src-api/S1.jsonl", "projects/-src-api/S1"])
         self.assertEqual(len(files), 2)
         self.assertTrue(record["id"].startswith("20260924T120000Z-"))
+
+    def test_last_activity_uses_the_terminal_start_when_more_recent(self):
+        # w1:p3's terminal_id is "term_a"; a real activity_of (built the same
+        # way a sweep builds one) must fold that terminal's agent_started_at
+        # into last_activity, not just the session's own (much older) record.
+        fake = fake_herdr(self)
+        records = {"claude:S1": {"first_seen": "2026-08-01T00:00:00Z"},
+                   "terminals": {"term_a": {"agent_started_at": "2026-09-20T00:00:00Z"}}}
+        activity_of = sweep._activity_lookup(records, None)
+        record, _ = archive.capture(Client(fake.path), TAB, PANES, self.table, activity_of, False, T0)
+        self.assertEqual(record["panes"]["w1:p3"]["last_activity"], "2026-09-20T00:00:00Z")
 
     def test_outermost_matching_process_wins(self):
         # pid5's argv[1:] is a superset of pid9's -- pid9 (the smaller tail)

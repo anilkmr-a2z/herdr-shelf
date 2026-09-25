@@ -88,6 +88,14 @@ class DecideTest(unittest.TestCase):
         reason = self.decide([pane("p1", session="S")])
         self.assertIsNone(reason)
 
+    def test_duplicate_conversation_in_two_panes_of_the_same_tab_is_not_eligible(self):
+        # Two panes in the *same* tab carrying the same session: open_in's
+        # set (keyed by tab_id) never grows past size 1 for this tab alone,
+        # so this must be caught independently of the open_in map.
+        panes = [pane("p1", session="S"), pane("p2", session="S")]
+        reason = self.decide(panes)
+        self.assertIn("also open in another pane", reason)
+
 
 class RunTest(unittest.TestCase):
     def setUp(self):
@@ -380,6 +388,53 @@ class RunTest(unittest.TestCase):
         self.assertIn("also open in another tab", reasons["old"])
         self.assertIn("also open in another tab", reasons["dup"])
 
+    def test_agent_started_at_survives_a_terminal_id_change_from_a_restart(self):
+        # A start recorded 2 hours ago under the pane's original terminal id.
+        old_terminal = self.panes[0]["terminal_id"]
+
+        def record_old_start(d):
+            d.setdefault("terminals", {})[old_terminal] = {"agent_started_at": iso(T0 - timedelta(hours=2))}
+            return True
+
+        activity.ActivityStore(self.state).update(record_old_start)
+        self.run_sweep()  # copies the terminal's start onto claude:OLD's own session record
+        # herdr restarts: the pane now has a brand new terminal id, and the
+        # old terminal's entry (if not already copied) would be pruned.
+        self.panes[0]["terminal_id"] = "term_after_restart"
+        report = self.run_sweep(now=T0 + timedelta(minutes=5))
+        self.assertNotIn("old", report["eligible"])
+
+    def test_live_recheck_catches_a_duplicate_that_appears_during_the_sweep(self):
+        # The duplicate does not exist yet at the initial gather -- only a
+        # stale open_in map (built once, up front) would miss it.
+        self.cfg["mode"] = "live"
+        original = self.fake.handlers["tab.list"]
+        count = {"n": 0}
+
+        def late_duplicate(p):
+            count["n"] += 1
+            if count["n"] == 2:  # "old"'s own per-target re-gather
+                self.tabs.append({"tab_id": "w1:t9", "workspace_id": "w1", "label": "dup", "focused": False})
+                self.panes.append(pane("w1:p9", session="OLD", tab="w1:t9"))
+            return original(p)
+
+        self.fake.handlers["tab.list"] = late_duplicate
+        report = self.run_sweep()
+        self.assertEqual(report["archived"], [])
+        self.assertNotIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+        reasons = dict(report["skipped"])
+        self.assertIn("also open in another tab", reasons["old"])
+
+    def test_archive_now_warns_but_proceeds_when_the_session_is_open_elsewhere(self):
+        self.tabs.append({"tab_id": "w1:t3", "workspace_id": "w1", "label": "dup", "focused": False})
+        self.panes.append(pane("w1:p3", session="OLD", tab="w1:t3"))
+        with self.assertLogs("shelf", level="WARNING") as cm:
+            archive_id = sweep.archive_now(Client(self.fake.path), self.cfg, self.state, agents.table(),
+                                           "w1:t1", now=T0)
+        self.assertTrue(archive_id)
+        self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+        self.assertTrue(any("also open in another tab" in m for m in cm.output))
+
 
 class RecordPresenceTest(unittest.TestCase):
     def test_working_pane_sets_last_status_so_a_later_done_event_counts(self):
@@ -405,6 +460,59 @@ class RecordPresenceTest(unittest.TestCase):
         tabs = [({}, [pane("p1", session="S")])]
         sweep._record_presence(data, tabs, T0)
         self.assertNotIn("terminals", data)
+
+    def test_terminal_start_is_copied_onto_the_sessions_own_record(self):
+        # So it survives a herdr restart, which assigns the pane a new
+        # terminal_id and would otherwise prune the only copy of this.
+        data = {"terminals": {"term_p1": {"agent_started_at": "2026-09-20T00:00:00Z"}}}
+        tabs = [({}, [pane("p1", session="S")])]
+        self.assertTrue(sweep._record_presence(data, tabs, T0))
+        self.assertEqual(data["claude:S"]["agent_started_at"], "2026-09-20T00:00:00Z")
+
+    def test_copying_the_terminal_start_never_regresses_a_later_value(self):
+        data = {"claude:S": {"agent_started_at": "2026-09-23T00:00:00Z"},
+                "terminals": {"term_p1": {"agent_started_at": "2026-09-20T00:00:00Z"}}}
+        tabs = [({}, [pane("p1", session="S")])]
+        sweep._record_presence(data, tabs, T0)
+        self.assertEqual(data["claude:S"]["agent_started_at"], "2026-09-23T00:00:00Z")
+
+    def test_pruning_keeps_a_terminal_started_at_or_after_this_sweeps_now(self):
+        # A concurrent track() call could record a brand new terminal id for
+        # a pane that was not part of this sweep's own tabs snapshot;
+        # pruning must not delete it just because it postdates that snapshot.
+        data = {"terminals": {"term_new": {"agent_started_at": iso(T0)}}}
+        tabs = [({}, [pane("p1", session="S")])]  # "term_new" isn't among these
+        sweep._record_presence(data, tabs, T0)
+        self.assertIn("term_new", data["terminals"])
+
+    def test_pruning_removes_a_terminal_started_well_before_this_sweep(self):
+        data = {"terminals": {"term_old": {"agent_started_at": iso(T0 - timedelta(days=5))}}}
+        tabs = [({}, [pane("p1", session="S")])]
+        sweep._record_presence(data, tabs, T0)
+        self.assertNotIn("term_old", data["terminals"])
+
+    def test_non_dict_terminals_value_is_reset(self):
+        data = {"terminals": [], "claude:S": {"first_seen": "2026-09-01T00:00:00Z"}}
+        tabs = [({}, [pane("p1", session="S")])]
+        changed = sweep._record_presence(data, tabs, T0)
+        self.assertTrue(changed)
+        self.assertEqual(data["terminals"], {})
+
+    def test_non_dict_terminal_entry_is_skipped_not_crashed(self):
+        data = {"terminals": {"t": "x"}, "claude:S": {"first_seen": "2026-09-01T00:00:00Z"}}
+        tabs = [({}, [pane("p1", session="S")])]  # pane's own terminal_id "term_p1" differs from "t"
+        sweep._record_presence(data, tabs, T0)  # must not raise
+        self.assertNotIn("t", data["terminals"])
+
+
+class ActivityLookupTest(unittest.TestCase):
+    def test_non_dict_terminals_value_is_ignored(self):
+        activity_of = sweep._activity_lookup({"terminals": []}, None)
+        self.assertIsNone(activity_of("claude", "S", "term1"))
+
+    def test_non_dict_terminal_entry_is_ignored(self):
+        activity_of = sweep._activity_lookup({"terminals": {"term1": "x"}}, None)
+        self.assertIsNone(activity_of("claude", "S", "term1"))
 
 
 class InstalledAtEligibilityTest(unittest.TestCase):

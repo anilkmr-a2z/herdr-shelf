@@ -2,11 +2,9 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from shelf import activity
 from shelf.api import Client
-from shelf.util import iso
 from tests.fakeherdr import FakeHerdr
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
@@ -124,6 +122,14 @@ class EffectiveTest(unittest.TestCase):
         rec = {"first_seen": stamp(T0 - timedelta(days=5))}
         self.assertEqual(activity.effective(rec, None, installed_at), T0 - timedelta(days=5))
 
+    def test_agent_started_at_counts_unconditionally_like_last_active(self):
+        # Old history/first_seen, but the agent was (re)started 20 minutes
+        # ago: that must count regardless of what history says, the same way
+        # last_active and restored_at do.
+        rec = {"first_seen": stamp(T0 - timedelta(days=30)), "agent_started_at": stamp(T0 - timedelta(minutes=20))}
+        history_ts = T0 - timedelta(days=31)
+        self.assertEqual(activity.effective(rec, history_ts, T0), T0 - timedelta(minutes=20))
+
 
 class StoreAndTrackTest(unittest.TestCase):
     def setUp(self):
@@ -136,7 +142,11 @@ class StoreAndTrackTest(unittest.TestCase):
             "agent": "claude", "kind": "id", "value": "S", "source": "herdr:claude"}}}
 
     def event(self, status):
-        return json.dumps({"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p1", "agent_status": status}})
+        # herdr's real envelope: the "event" field (and "data.type") are
+        # snake_case EventKind names, not the dot-form hook name.
+        return json.dumps({"event": "pane_agent_status_changed",
+                            "data": {"type": "pane_agent_status_changed", "pane_id": "w1:p1",
+                                     "workspace_id": "w1", "agent_status": status, "agent": "claude"}})
 
     def test_working_is_recorded(self):
         self.assertTrue(activity.track(Client(self.fake.path), self.store, self.event("working"), None, T0))
@@ -154,7 +164,8 @@ class StoreAndTrackTest(unittest.TestCase):
         self.assertEqual(self.store.load(), {})
 
     def test_pane_id_falls_back_to_env(self):
-        ev = json.dumps({"event": "pane.agent_status_changed", "data": {"agent_status": "blocked"}})
+        ev = json.dumps({"event": "pane_agent_status_changed",
+                          "data": {"type": "pane_agent_status_changed", "agent_status": "blocked"}})
         self.assertTrue(activity.track(Client(self.fake.path), self.store, ev, "w1:p9", T0))
         self.assertEqual(self.fake.calls, [("pane.get", {"pane_id": "w1:p9"})])
 
@@ -163,7 +174,7 @@ class StoreAndTrackTest(unittest.TestCase):
         self.assertFalse(activity.track(Client(self.fake.path), self.store, None, None, T0))
 
     def test_non_dict_data_is_ignored(self):
-        ev = json.dumps({"event": "pane.agent_status_changed", "data": ["nope"]})
+        ev = json.dumps({"event": "pane_agent_status_changed", "data": ["nope"]})
         self.assertFalse(activity.track(Client(self.fake.path), self.store, ev, None, T0))
         self.assertEqual(self.store.load(), {})
         self.assertEqual(self.fake.calls, [])
@@ -182,8 +193,12 @@ class StoreAndTrackTest(unittest.TestCase):
 
 class AgentDetectedTrackTest(unittest.TestCase):
     """track() handling pane.agent_detected: an agent (re)started in a pane
-    counts as activity, keyed by the pane's terminal, unless herdr itself is
-    still resuming panes from its own restart (the startup grace period)."""
+    counts as activity, keyed by the pane's terminal. Event shapes match
+    herdr's real payload: the JSON envelope's own "event" (and "data.type")
+    are the snake_case EventKind name "pane_agent_detected", not the dot-form
+    hook name -- that dot form only ever appears in HERDR_PLUGIN_EVENT
+    (env_event), passed to track() separately.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -194,10 +209,15 @@ class AgentDetectedTrackTest(unittest.TestCase):
         self.fake.handlers["pane.get"] = lambda p: {"pane": {"pane_id": p["pane_id"], "terminal_id": "term1"}}
 
     def event(self, agent="claude", released=False, pane_id="w1:p1", include_agent=True):
-        data = {"pane_id": pane_id, "released": released}
+        # herdr omits "released" entirely when it is false, and omits "agent"
+        # on a release -- a released event never carries an agent name.
+        data = {"type": "pane_agent_detected", "pane_id": pane_id, "workspace_id": "w1"}
         if include_agent:
             data["agent"] = agent
-        return json.dumps({"event": "pane.agent_detected", "data": data})
+        if released:
+            data["released"] = True
+            data["final_status"] = "idle"
+        return json.dumps({"event": "pane_agent_detected", "data": data})
 
     def test_agent_detected_records_agent_started_at(self):
         client = Client(self.fake.path)
@@ -214,23 +234,43 @@ class AgentDetectedTrackTest(unittest.TestCase):
         self.assertFalse(activity.track(client, self.store, self.event(include_agent=False), None, T0))
         self.assertEqual(self.store.load(), {})
 
-    def test_within_startup_grace_records_nothing(self):
-        (Path(self.tmp.name) / "server_started_at").write_text(iso(T0) + "\n")
-        client = Client(self.fake.path)
-        self.assertFalse(activity.track(client, self.store, self.event(), None, T0 + timedelta(minutes=5)))
-        self.assertEqual(self.store.load(), {})
-
-    def test_after_startup_grace_records_normally(self):
-        (Path(self.tmp.name) / "server_started_at").write_text(iso(T0) + "\n")
-        client = Client(self.fake.path)
-        self.assertTrue(activity.track(client, self.store, self.event(), None, T0 + timedelta(minutes=11)))
-        self.assertIn("term1", self.store.load()["terminals"])
-
     def test_no_terminal_id_is_ignored(self):
         self.fake.handlers["pane.get"] = lambda p: {"pane": {"pane_id": p["pane_id"]}}
         client = Client(self.fake.path)
         self.assertFalse(activity.track(client, self.store, self.event(), None, T0))
         self.assertEqual(self.store.load(), {})
+
+    def test_env_event_alone_is_enough_to_recognize_the_event(self):
+        # Only HERDR_PLUGIN_EVENT says so; the JSON payload's own event name
+        # (deliberately wrong here) must not be the only signal consulted.
+        client = Client(self.fake.path)
+        ev = json.dumps({"event": "something_else", "data": {"pane_id": "w1:p1", "agent": "claude"}})
+        self.assertTrue(activity.track(client, self.store, ev, None, T0, "pane.agent_detected"))
+        self.assertIn("term1", self.store.load()["terminals"])
+
+    def test_data_type_alone_is_enough_to_recognize_the_event(self):
+        # No "event" field at all and no env_event, only data.type.
+        client = Client(self.fake.path)
+        ev = json.dumps({"data": {"type": "pane_agent_detected", "pane_id": "w1:p1", "agent": "claude"}})
+        self.assertTrue(activity.track(client, self.store, ev, None, T0))
+        self.assertIn("term1", self.store.load()["terminals"])
+
+    def test_also_writes_agent_started_at_onto_the_sessions_own_record(self):
+        # When pane.get already reports the pane's agent_session, the start
+        # is written directly onto that session's record too, so it is not
+        # lost if the terminal_id later changes (e.g. a herdr restart).
+        self.fake.handlers["pane.get"] = lambda p: {"pane": {
+            "pane_id": p["pane_id"], "terminal_id": "term1",
+            "agent_session": {"agent": "claude", "kind": "id", "value": "S1", "source": "herdr:claude"}}}
+        client = Client(self.fake.path)
+        self.assertTrue(activity.track(client, self.store, self.event(), None, T0))
+        self.assertEqual(self.store.load()["claude:S1"]["agent_started_at"], "2026-09-24T12:00:00Z")
+
+    def test_without_an_agent_session_only_the_terminal_is_recorded(self):
+        client = Client(self.fake.path)
+        self.assertTrue(activity.track(client, self.store, self.event(), None, T0))
+        data = self.store.load()
+        self.assertEqual(list(data.keys()), ["terminals"])
 
 
 if __name__ == "__main__":

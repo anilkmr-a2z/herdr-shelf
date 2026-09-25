@@ -69,9 +69,9 @@ count.
 Starting or resuming an agent in a pane also counts as activity -- for example
 resuming an old conversation by hand with `claude --resume <id>`, or an agent
 that restarts on its own -- even though that alone sends no message and would
-otherwise leave the session looking exactly as idle as before. The one
-exception is herdr's own resume of a pane it restored itself on a server
-restart: that does not count, for the first 10 minutes after herdr starts.
+otherwise leave the session looking exactly as idle as before. This survives
+herdr restarting too: it is remembered against the conversation itself, not
+just the pane it happened in.
 
 For Claude Code and Codex it also reads the agent's own session files, so tabs
 that were already inactive before you installed Shelf can qualify on the first
@@ -199,8 +199,11 @@ above) if you want everything gone.
 - Agents without a session id from herdr cannot be resumed, so their tabs are
   never archived.
 - A conversation open in two tabs at once (the same session resumed twice) is
-  left alone by both the sweep and restore, rather than risk duplicating it
-  into two tabs; close one of the tabs first.
+  left alone by the sweep, rather than risk duplicating it into two tabs;
+  close one of the tabs first. A manual `archive <tab-id>` archives it anyway
+  (with a warning), since it is a single, explicit action on one tab, but
+  restoring the resulting archive entry will then refuse until the other
+  live copy is closed.
 - There is no pin or snooze yet. A tab you want to keep can be restored in one
   key press.
 - A one-word prompt given on the agent's command line (`claude hello`) cannot be

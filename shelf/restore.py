@@ -92,7 +92,8 @@ def restore(client, arch, store, archive_id: str, table: dict, now: datetime) ->
         # conversation in two tabs at once. Refuse and keep the archive entry.
         live_panes = client.call("pane.list").get("panes", [])
         live_sessions = {p["agent_session"]["value"] for p in live_panes
-                         if isinstance(p.get("agent_session"), dict) and p["agent_session"].get("value")}
+                         if p.get("agent") and isinstance(p.get("agent_session"), dict)
+                         and p["agent_session"].get("value")}
         for meta in panes.values():
             value = (meta.get("session") or {}).get("value")
             if value and value in live_sessions:

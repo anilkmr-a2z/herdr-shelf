@@ -218,6 +218,16 @@ class RestoreTest(unittest.TestCase):
         result = self.run_restore()
         self.assertEqual(result["tab_id"], "w1:t7")
 
+    def test_stale_agent_session_without_a_running_agent_does_not_block_restore(self):
+        # A live pane can carry a leftover agent_session even though its own
+        # "agent" is now empty (e.g. it became a shell pane); matching the
+        # sweep's own rule, that must not count as "still open".
+        self.fake.handlers["pane.list"] = lambda p: {"panes": [
+            {"pane_id": "w9:p1", "tab_id": "w9:t1", "terminal_id": "term_other", "agent": None,
+             "agent_session": {"agent": "claude", "kind": "id", "value": "S1", "source": "herdr:claude"}}]}
+        result = self.run_restore()
+        self.assertEqual(result["tab_id"], "w1:t7")
+
     def test_warnings_fall_back_to_workspace_label_or_tab_when_both_are_none(self):
         (self.claude / "projects" / "-src-api" / "S1.jsonl").unlink()
 
