@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from typing import Any
 
 UTC = timezone.utc
 _FRACTION = re.compile(r"\.(\d+)")
+_OFFSET_NO_COLON = re.compile(r"([+-]\d{2})(\d{2})$")
 
 
 def now() -> datetime:
@@ -20,6 +22,8 @@ def now() -> datetime:
 
 
 def iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -28,10 +32,13 @@ def parse_iso(text: Any) -> datetime | None:
 
     Returns an aware UTC datetime, or None when the value is not a timestamp.
     Naive timestamps are taken as UTC. Fractions of any length are accepted.
+    A trailing numeric offset without a colon (+HHMM) is normalized to +HH:MM
+    so this parses the same way on Python 3.9 and 3.12.
     """
     if not isinstance(text, str) or not text.strip():
         return None
     s = text.strip().replace("Z", "+00:00")
+    s = _OFFSET_NO_COLON.sub(r"\1:\2", s)
     s = _FRACTION.sub(lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
     try:
         dt = datetime.fromisoformat(s)
@@ -46,7 +53,7 @@ def read_json(path: Path, default: Any) -> Any:
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError):
         return default
 
 
@@ -59,6 +66,8 @@ def atomic_write_json(path: Path, data: Any) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -66,6 +75,14 @@ def atomic_write_json(path: Path, data: Any) -> None:
         except FileNotFoundError:
             pass
         raise
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 class LockBusy(Exception):
@@ -73,45 +90,38 @@ class LockBusy(Exception):
 
 
 class FileLock:
-    """Exclusive lock file created with O_EXCL.
+    """Exclusive lock using fcntl.flock on a lock file.
 
     wait_seconds: how long to retry before raising LockBusy (0 means try once).
-    stale_seconds: a lock file older than this is assumed abandoned and removed.
+    The lock is held by an open file descriptor, so if the holding process dies
+    (even via SIGKILL) the kernel releases the lock automatically. The lock
+    file itself is never deleted.
     """
 
-    def __init__(self, path: Path, wait_seconds: float = 0.0, stale_seconds: float = 600.0):
+    def __init__(self, path: Path, wait_seconds: float = 0.0):
         self.path = Path(path)
         self.wait_seconds = wait_seconds
-        self.stale_seconds = stale_seconds
+        self._fd: int | None = None
 
     def __enter__(self) -> "FileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
         deadline = time.monotonic() + self.wait_seconds
         while True:
             try:
-                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            except FileExistsError:
-                try:
-                    age = time.time() - self.path.stat().st_mtime
-                except FileNotFoundError:
-                    continue
-                if age > self.stale_seconds:
-                    try:
-                        self.path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    continue
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
                 if time.monotonic() >= deadline:
+                    os.close(fd)
                     raise LockBusy(str(self.path))
                 time.sleep(0.05)
                 continue
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            return self
+            break
+        self._fd = fd
+        return self
 
     def __exit__(self, *exc: Any) -> bool:
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
         return False

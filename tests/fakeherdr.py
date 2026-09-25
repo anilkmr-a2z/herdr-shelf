@@ -23,6 +23,7 @@ class FakeHerdr:
     def __init__(self, handlers=None):
         self.handlers = dict(handlers or {})
         self.calls = []
+        self.errors = []
         self._dir = tempfile.mkdtemp(prefix="shelf-")
         self.path = os.path.join(self._dir, "h.sock")
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -62,6 +63,9 @@ class FakeHerdr:
                         resp = {"id": req["id"], "result": handler(params)}
                     except FakeError as e:
                         resp = {"id": req["id"], "error": {"code": e.code, "message": e.message}}
+                    except Exception as e:
+                        self.errors.append(e)
+                        resp = {"id": req["id"], "error": {"code": "fake_handler_error", "message": repr(e)}}
                 conn.sendall((json.dumps(resp) + "\n").encode())
 
     def methods(self):

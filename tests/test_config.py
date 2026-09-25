@@ -45,6 +45,10 @@ class ConfigTest(unittest.TestCase):
         bad_values = [
             {"mode": "yes"}, {"idle_days": 0}, {"idle_days": True}, {"keep_transcripts": "no"},
             {"agents": []}, {"agents": {"x": 1}}, {"sweep_interval_minutes": -1}, [1, 2],
+            '{"idle_days": Infinity}', '{"idle_days": NaN}', {"idle_days": 100000},
+            {"agents": {"x": {"resume": "--load {id}"}}},
+            {"agents": {"x": {"relaunch": "fancy"}}},
+            {"agents": {"x": {"strip": "-r"}}},
         ]
         for bad in bad_values:
             with self.subTest(bad=bad), tempfile.TemporaryDirectory() as d:

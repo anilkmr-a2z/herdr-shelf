@@ -382,8 +382,8 @@ entry. Used for the release check and for archiving a tab by hand.
 - An error on one tab is logged and the sweep continues with the next tab.
 - Errors go to `shelf.log` and to stderr, which herdr keeps in `herdr plugin log`.
 - A failed restore keeps the archive entry and shows a notification with the error.
-- Lock files are created with `O_EXCL`. A lock older than 10 minutes is treated as
-  stale and removed.
+- Locks use `fcntl.flock`, so a lock held by a process that dies is released by
+  the kernel; lock files are never deleted.
 
 ## Testing
 
