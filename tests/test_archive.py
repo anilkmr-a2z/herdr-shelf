@@ -155,6 +155,46 @@ class CaptureTest(unittest.TestCase):
         with self.assertRaises(archive.Skip):
             archive.capture(Client(fake.path), TAB, panes, self.table, self.activity_of, False, T0)
 
+    def test_layout_with_exactly_24_panes_is_allowed(self):
+        fake = fake_herdr(self)
+        pane_ids = [f"w1:p{i}" for i in range(1, 25)]  # exactly herdr's 24-pane limit
+
+        def balanced(nodes):
+            if len(nodes) == 1:
+                return nodes[0]
+            mid = len(nodes) // 2
+            return {"type": "split", "direction": "right", "ratio": 0.5,
+                    "first": balanced(nodes[:mid]), "second": balanced(nodes[mid:])}
+
+        root = balanced([{"type": "pane", "pane_id": pid, "cwd": "/src"} for pid in pane_ids])
+        fake.handlers["layout.export"] = lambda p: {"layout": {
+            "workspace_id": "w1", "tab_id": "w1:t2", "zoomed": False,
+            "focused_pane_id": pane_ids[0], "root": root}}
+        panes = [{"pane_id": pid, "tab_id": "w1:t2", "terminal_id": f"term_{pid}", "cwd": "/src"}
+                 for pid in pane_ids]
+        record, _ = archive.capture(Client(fake.path), TAB, panes, self.table, self.activity_of, False, T0)
+        self.assertEqual(len(record["panes"]), 24)
+
+    def test_layout_with_exactly_depth_16_is_allowed(self):
+        fake = fake_herdr(self)
+
+        def chain(n, i=1):
+            if n == 1:
+                return {"type": "pane", "pane_id": f"w1:p{i}", "cwd": "/src"}
+            return {"type": "split", "direction": "right", "ratio": 0.5,
+                    "first": {"type": "pane", "pane_id": f"w1:p{i}", "cwd": "/src"},
+                    "second": chain(n - 1, i + 1)}
+
+        root = chain(16)  # exactly herdr's 16-deep limit
+        pane_ids = [f"w1:p{i}" for i in range(1, 17)]
+        fake.handlers["layout.export"] = lambda p: {"layout": {
+            "workspace_id": "w1", "tab_id": "w1:t2", "zoomed": False,
+            "focused_pane_id": pane_ids[0], "root": root}}
+        panes = [{"pane_id": pid, "tab_id": "w1:t2", "terminal_id": f"term_{pid}", "cwd": "/src"}
+                 for pid in pane_ids]
+        record, _ = archive.capture(Client(fake.path), TAB, panes, self.table, self.activity_of, False, T0)
+        self.assertEqual(len(record["panes"]), 16)
+
 
 class ArchiveTabTest(unittest.TestCase):
     def setUp(self):

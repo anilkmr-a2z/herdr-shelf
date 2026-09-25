@@ -11,7 +11,7 @@ from unittest import mock
 
 from shelf.__main__ import main
 from shelf.api import HerdrError
-from shelf.util import FileLock
+from shelf.util import FileLock, iso, now
 from tests.fakeherdr import FakeError, FakeHerdr
 
 
@@ -75,6 +75,16 @@ class MainTest(unittest.TestCase):
         log_path = Path(self.tmp.name) / "shelf.log"
         self.assertTrue(log_path.exists())
         self.assertIn("track", log_path.read_text())
+
+    def test_if_due_hook_skips_loading_config_when_not_due(self):
+        # A sweep just happened (last_sweep is recent), so this is not due
+        # per the default 60-minute interval: config.load must never even be
+        # called, so its "unknown key(s)" warning cannot flood shelf.log on
+        # every focus-change hook between actual sweeps.
+        (Path(self.tmp.name) / "last_sweep").write_text(iso(now()) + "\n")
+        with mock.patch("shelf.__main__.config.load") as load, redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["sweep", "--if-due"]), 0)
+        load.assert_not_called()
 
     def test_pick_failure_is_logged(self):
         # No HERDR_SOCKET_PATH is set, so Client() raises inside _pick;

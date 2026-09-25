@@ -41,6 +41,11 @@ class BuildTreeTest(unittest.TestCase):
         self.assertEqual(first["command"], agents.shell_command(["claude", "--model", "opus", "--resume", "S1"]))
         self.assertEqual(second, {"type": "pane", "cwd": "/src/api/logs", "label": "logs"})
 
+    def test_argv_log_collects_the_computed_argv_by_pane_id(self):
+        argv_log = {}
+        restore.build_tree(RECORD["layout"]["root"], RECORD["panes"], agents.table(), argv_log)
+        self.assertEqual(argv_log, {"w1:p3": ["claude", "--model", "opus", "--resume", "S1"]})
+
 
 class RestoreTest(unittest.TestCase):
     def setUp(self):
@@ -92,6 +97,20 @@ class RestoreTest(unittest.TestCase):
             self.run_restore()
         self.assertTrue(any("restored 20260920T000000Z-aaaaaa into w1:t7" in m for m in cm.output))
         self.assertTrue(any("claude:S1:" in m and "--resume" in m and "S1" in m for m in cm.output))
+
+    def test_prompt_like_launch_argv_warns_only_once(self):
+        # A launch_argv with a whitespace-containing token looks like it
+        # carried a prompt: agents.relaunch_argv logs a warning and falls
+        # back to a plain relaunch. That call must happen only once per
+        # pane -- once to build the tree and again to log it would double
+        # the warning.
+        record = self._record_with_existing_pane_cwds(id="20260901T000000Z-dddddd")
+        record["panes"]["w1:p3"]["launch_argv"] = ["claude", "fix the bug"]
+        self.arch.save(record, [])
+        with self.assertLogs("shelf", level="WARNING") as cm:
+            restore.restore(Client(self.fake.path), self.arch, self.store, record["id"], agents.table(), T0)
+        warnings = [m for m in cm.output if "looked like it carried a prompt" in m]
+        self.assertEqual(len(warnings), 1)
 
     def test_into_existing_workspace(self):
         result = self.run_restore()

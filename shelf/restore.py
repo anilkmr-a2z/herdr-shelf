@@ -19,15 +19,22 @@ log = logging.getLogger("shelf")
 RESTORE_LOCK_WAIT_SECONDS = 30.0
 
 
-def build_tree(node: dict, panes_meta: dict, table: dict) -> dict:
-    """The layout.apply tree: same splits, agent panes resume, shell panes get a shell."""
+def build_tree(node: dict, panes_meta: dict, table: dict, argv_log: dict | None = None) -> dict:
+    """The layout.apply tree: same splits, agent panes resume, shell panes get a shell.
+
+    argv_log, when given, collects each agent pane's relaunch argv keyed by
+    pane_id as a side effect, so a caller can log exactly what was used
+    without calling agents.relaunch_argv a second time -- that call can itself
+    log a warning (a saved command that looked like it carried a prompt), and
+    a second call would log it again.
+    """
     if node.get("type") == "split":
         return {
             "type": "split",
             "direction": node["direction"],
             "ratio": node["ratio"],
-            "first": build_tree(node["first"], panes_meta, table),
-            "second": build_tree(node["second"], panes_meta, table),
+            "first": build_tree(node["first"], panes_meta, table, argv_log),
+            "second": build_tree(node["second"], panes_meta, table, argv_log),
         }
     meta = panes_meta.get(node.get("pane_id"), {})
     out = {"type": "pane"}
@@ -40,6 +47,8 @@ def build_tree(node: dict, panes_meta: dict, table: dict) -> dict:
     if agent in table and meta.get("session", {}).get("value"):
         argv = agents.relaunch_argv(agent, table[agent], meta["session"]["value"], meta.get("launch_argv"))
         out["command"] = agents.shell_command(argv)
+        if argv_log is not None:
+            argv_log[node.get("pane_id")] = argv
     return out
 
 
@@ -77,7 +86,8 @@ def restore(client, arch, store, archive_id: str, table: dict, now: datetime) ->
             warnings.append(f"{label}: {cwd} no longer exists; "
                             "the pane opens in herdr's fallback directory")
 
-        params = {"root": build_tree(record["layout"]["root"], panes, table),
+        argv_log = {}
+        params = {"root": build_tree(record["layout"]["root"], panes, table, argv_log),
                   "tab_label": record["tab"].get("label"), "focus": True}
         workspace = record.get("workspace", {})
         workspace_id = _find_workspace(client, workspace.get("label"))
@@ -119,11 +129,11 @@ def restore(client, arch, store, archive_id: str, table: dict, now: datetime) ->
         # control), the session id it was relaunched with is still in
         # shelf.log rather than gone along with the archive entry.
         log.info("restored %s into %s", archive_id, tab_id)
-        for meta in panes.values():
-            agent = meta.get("agent")
-            if agent in table and meta.get("session", {}).get("value"):
-                argv = agents.relaunch_argv(agent, table[agent], meta["session"]["value"], meta.get("launch_argv"))
-                log.info("%s: %s", activity.session_key(agent, meta["session"]["value"]), argv)
+        for pane_id, argv in argv_log.items():
+            meta = panes.get(pane_id, {})
+            session = meta.get("session") or {}
+            if meta.get("agent") and session.get("value"):
+                log.info("%s: %s", activity.session_key(meta["agent"], session["value"]), argv)
 
         try:
             store.update(mark)

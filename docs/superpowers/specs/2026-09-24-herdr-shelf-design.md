@@ -125,10 +125,14 @@ For a session, effective activity is the latest of:
 A tab is archived when all of the following hold:
 
 1. It has at least one agent pane.
-2. Every agent pane has an `agent_session`, its agent has an entry in the agent
+2. Every agent pane's `agent_session.agent` matches the pane's own current
+   agent. herdr can leave a previous agent's session on a pane where a
+   different agent now runs (for example the pane was reused); a session
+   whose agent no longer matches is never used to decide or resume that pane.
+3. Every agent pane has an `agent_session`, its agent has an entry in the agent
    table, and its effective activity is older than `idle_days`.
-3. No pane in the tab has agent status `working`.
-4. The tab is not the focused tab.
+4. No pane in the tab has agent status `working`.
+5. The tab is not the focused tab.
 
 Blocked agents are treated like any other: blocked with no activity for
 `idle_days` is archived. Shell panes inside an eligible tab are archived with it
@@ -289,6 +293,13 @@ nested. All keys are optional.
 - `agents`: per-agent overrides merged over the built-in table. `strip` lists flags
   that take a value; flags without a value go in `strip_bare`.
 
+An unknown top-level key, or an unknown key inside an `agents` entry, is logged as
+a warning and otherwise ignored; it does not fail config loading. A per-agent
+`resume` must be a non-empty list of strings containing `"{id}"` in at least one
+element (nothing to substitute the session id into, otherwise), and `program`, if
+given, must be a non-empty string. Either failing raises `ConfigError`, same as an
+invalid top-level value.
+
 ## State directory layout
 
 Under `HERDR_PLUGIN_STATE_DIR`:
@@ -396,7 +407,10 @@ not removed.
    the layout's pane ids exactly. herdr 0.9.0 tab/pane ids are positional, so
    a close elsewhere between gathering the tab's panes and this step can mean
    the tab id we hold now points at a different tab; a mismatch skips the tab
-   rather than archiving the wrong one.
+   rather than archiving the wrong one. The layout is then checked against
+   herdr's own `layout.apply` limits (24 panes, 16 levels deep); a layout past
+   either limit is skipped rather than archived, since it could never be
+   restored.
 2. For each agent pane, `pane.process_info`, and among the foreground
    processes whose `name`, or the basename of whose `argv[0]`, equals the
    agent table's `program`, take the one whose remaining arguments (`argv[1:]`,

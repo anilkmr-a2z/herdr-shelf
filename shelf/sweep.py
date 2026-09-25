@@ -97,7 +97,15 @@ def _activity_lookup(records: dict, installed_at: datetime | None):
     return activity_of
 
 
-def _due(state: Path, interval_minutes: float, now: datetime) -> bool:
+def is_due(state: Path, interval_minutes: float, now: datetime) -> bool:
+    """Whether sweep_interval_minutes has passed since last_sweep.
+
+    Public so a caller (the CLI's `sweep --if-due` hook) can check this
+    before loading config at all, using a default interval, and skip loading
+    config entirely when a sweep is not due -- config.load's own "unknown
+    key(s)" warning would otherwise fire on every hook invocation instead of
+    at most once per interval.
+    """
     try:
         last = parse_iso((state / "last_sweep").read_text().strip())
     except FileNotFoundError:
@@ -125,7 +133,14 @@ def _installed_at(state: Path, now: datetime) -> datetime:
 
 
 def _workspace_labels(client) -> dict:
-    return {ws.get("workspace_id"): ws.get("label") for ws in client.call("workspace.list").get("workspaces", [])}
+    try:
+        workspaces = client.call("workspace.list").get("workspaces", [])
+    except HerdrError as e:
+        # Display labels are a nicety, not essential: a failed workspace.list
+        # must not end the whole sweep. Tab labels alone are used instead.
+        log.warning("workspace.list failed; tab labels will not include a workspace name: %s", e)
+        return {}
+    return {ws.get("workspace_id"): ws.get("label") for ws in workspaces}
 
 
 def _display_label(tab: dict, workspace_labels: dict) -> str:
@@ -178,7 +193,7 @@ def run(client, cfg: dict, state_dir, table: dict, if_due: bool = False, now: da
     """One sweep. Returns the report, or None when not due or another sweep is running."""
     now = now or utc_now()
     state = Path(state_dir)
-    if if_due and not _due(state, cfg["sweep_interval_minutes"], now):
+    if if_due and not is_due(state, cfg["sweep_interval_minutes"], now):
         return None
     lock = FileLock(state / "sweep.lock")
     try:
@@ -189,7 +204,7 @@ def run(client, cfg: dict, state_dir, table: dict, if_due: bool = False, now: da
         # Another sweep may have run (and updated last_sweep) between the
         # check above and actually getting the lock; re-check now to avoid
         # double-sweeping right after it.
-        if if_due and not _due(state, cfg["sweep_interval_minutes"], now):
+        if if_due and not is_due(state, cfg["sweep_interval_minutes"], now):
             return None
         report = {"mode": cfg["mode"], "eligible": [], "archived": [], "failed": [], "skipped": []}
         gathered = []

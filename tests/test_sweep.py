@@ -217,7 +217,7 @@ class RunTest(unittest.TestCase):
 
     def test_if_due_is_rechecked_after_acquiring_the_lock(self):
         self.cfg["mode"] = "live"
-        with mock.patch("shelf.sweep._due", side_effect=[True, False]):
+        with mock.patch("shelf.sweep.is_due", side_effect=[True, False]):
             result = self.run_sweep(if_due=True)
         self.assertIsNone(result)
         self.assertNotIn("tab.close", self.fake.methods())
@@ -278,6 +278,36 @@ class RunTest(unittest.TestCase):
         with self.assertLogs("shelf", level="INFO") as cm:
             self.run_sweep()
         self.assertTrue(any("skip here: focused" in message for message in cm.output))
+
+    def test_installed_at_is_written_once_and_never_rewritten(self):
+        self.run_sweep(now=T0)
+        first = (self.state / "installed_at").read_text()
+        self.run_sweep(now=T0 + timedelta(hours=2))
+        second = (self.state / "installed_at").read_text()
+        self.assertEqual(first, second)
+
+    def test_workspace_list_failure_falls_back_to_no_workspace_labels(self):
+        # Tab "old" already has its own (non-numeric) label, so it is
+        # reported normally even though workspace.list itself failed.
+        def fail(p):
+            raise FakeError("unavailable", "no herdr")
+
+        self.fake.handlers["workspace.list"] = fail
+        report = self.run_sweep()
+        self.assertEqual(report["eligible"], ["old"])
+
+    def test_workspace_list_failure_still_reports_a_numeric_label_as_is(self):
+        self.tabs.append({"tab_id": "w1:t3", "workspace_id": "w1", "label": "7", "focused": False})
+        self.panes.append(pane("w1:p3", session="OLD3", tab="w1:t3"))
+        activity.ActivityStore(self.state).update(
+            lambda d: d.update({"claude:OLD3": {"first_seen": "2026-09-01T00:00:00Z"}}))
+
+        def fail(p):
+            raise FakeError("unavailable", "no herdr")
+
+        self.fake.handlers["workspace.list"] = fail
+        report = self.run_sweep()
+        self.assertEqual(sorted(report["eligible"]), ["7", "old"])
 
     def test_numeric_or_missing_tab_label_falls_back_to_workspace_label(self):
         self.tabs.append({"tab_id": "w1:t3", "workspace_id": "w1", "label": "7", "focused": False})

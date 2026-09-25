@@ -196,6 +196,13 @@ def _dispatch(command: str, args: list, state: Path) -> int:
         return 0
     if command == "sweep":
         if_due = "--if-due" in args
+        if if_due and not sweep.is_due(state, config.DEFAULTS["sweep_interval_minutes"], now()):
+            # Checked before config is even loaded, using the default
+            # interval: config.load's own "unknown key(s)" warning must not
+            # fire on every hook invocation (startup, every focus change)
+            # when a sweep is not due anyway. sweep.run() re-checks with the
+            # real configured interval once it does load config below.
+            return 0
         cfg = config.load(_config_dir())
         client = Client()
         report = sweep.run(client, cfg, state, agents.table(cfg["agents"]), if_due=if_due)

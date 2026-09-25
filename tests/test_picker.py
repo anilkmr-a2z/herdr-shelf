@@ -119,14 +119,31 @@ class RunTest(unittest.TestCase):
         self.assertEqual(restored, [])
 
     def test_delete_runs_under_the_sweep_lock(self):
+        # Held for the whole run() call (not just around the FileLock use) so
+        # a leftover lock-busy from this test can never bleed into another.
         arch = FakeArchive(RECORDS)
+        out = []
         with FileLock(arch.root.parent / "sweep.lock"), \
                 mock.patch("shelf.picker.DELETE_LOCK_WAIT_SECONDS", 0.1):
             answers = iter(["d2", "y", "q"])
-            with self.assertRaises(LockBusy):
-                picker.run(arch, lambda archive_id: {"tab_id": "t", "warnings": []}, lambda: T0,
-                           input_fn=lambda prompt: next(answers), print_fn=lambda *_: None)
+            picker.run(arch, lambda archive_id: {"tab_id": "t", "warnings": []}, lambda: T0,
+                       input_fn=lambda prompt: next(answers), print_fn=out.append)
         self.assertEqual(arch.deleted, [])
+        self.assertTrue(any("A sweep is running; try again in a moment." in line for line in out))
+        self.assertFalse(any("sweep.lock" in line for line in out))
+
+    def test_restore_lock_busy_shows_friendly_message_and_continues(self):
+        arch = FakeArchive(RECORDS)
+        lock_path = arch.root.parent / "sweep.lock"
+
+        def do_restore(archive_id):
+            raise LockBusy(str(lock_path))
+
+        answers = iter(["1", "q"])
+        out = []
+        picker.run(arch, do_restore, lambda: T0, input_fn=lambda prompt: next(answers), print_fn=out.append)
+        self.assertTrue(any("A sweep is running; try again in a moment." in line for line in out))
+        self.assertFalse(any(str(lock_path) in line for line in out))
 
     def test_invalid_reprompts(self):
         _, restored, out, _ = self.run_picker(["9", "1"])

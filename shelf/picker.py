@@ -8,7 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .util import FileLock, parse_iso
+from .util import FileLock, LockBusy, parse_iso
 
 ESC = "\x1b"
 CLEAR_SCREEN = "\033[H\033[2J"
@@ -130,15 +130,25 @@ def run(arch, do_restore, now_fn, input_fn=input, print_fn=print, notify=lambda 
         if choice == "delete":
             answer = input_fn(f'Delete "{record_label(record)}"? This cannot be undone. [y/N] ')
             if answer.strip().lower() in ("y", "yes"):
-                # Under the same lock a sweep uses, so a delete never races a
-                # sweep archiving or reading the same archive directory.
-                with FileLock(state_dir / "sweep.lock", wait_seconds=DELETE_LOCK_WAIT_SECONDS):
-                    arch.delete(record["id"])
+                try:
+                    # Under the same lock a sweep uses, so a delete never
+                    # races a sweep archiving or reading the same archive
+                    # directory.
+                    with FileLock(state_dir / "sweep.lock", wait_seconds=DELETE_LOCK_WAIT_SECONDS):
+                        arch.delete(record["id"])
+                except LockBusy:
+                    # Held until the next render, like the "invalid choice"
+                    # message, rather than the lock file's path.
+                    pending_message = "A sweep is running; try again in a moment."
             continue
         print_fn("Restoring...")
         previous = _ignore_sigint()
         try:
             result = do_restore(record["id"])
+        except LockBusy:
+            _restore_sigint(previous)
+            pending_message = "A sweep is running; try again in a moment."
+            continue
         except Exception as e:  # keep the entry and the popup; show why
             _restore_sigint(previous)
             print_fn(f"Restore failed: {e}")
