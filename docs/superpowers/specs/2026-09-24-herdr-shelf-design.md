@@ -92,6 +92,10 @@ including activity from before the plugin was installed. Two ship with the plugi
 - **Codex:** the timestamp of the last `response_item` or `event_msg` entry in
   `$CODEX_HOME/sessions/**/rollout-*-<session-id>.jsonl` (default `~/.codex`).
 
+For both, the session id must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; anything
+else is rejected before it is ever used to build a glob pattern. When several
+files match an id, the one with the newest modification time is used.
+
 A history source that fails to read its file is ignored for that sweep; the
 generic signal still applies.
 
@@ -131,7 +135,7 @@ resume arguments are appended. It mirrors herdr's `src/agent_resume.rs`.
 
 | herdr agent | Program | Resume args | Also stripped |
 |---|---|---|---|
-| `claude` | `claude` | `--resume {id}` | `-r <x>`, `--continue`, `-c` |
+| `claude` | `claude` | `--resume {id}` | `-r <x>`, `--continue`, `-c`, `--session-id <x>`, `--fork-session` |
 | `codex` | `codex` | `resume {id}` | a `resume <x>` subcommand |
 | `copilot` | `copilot` | `--resume={id}` | |
 | `devin` | `devin` | `--resume {id}` | |
@@ -162,6 +166,20 @@ Users can add or override entries in config (see Configuration). An entry may se
 `<program> <resume args>` exactly as herdr does on a server restart. That is the
 escape hatch for agents started with a positional prompt such as
 `claude "fix the build"`, where keeping the saved argv would send that prompt again.
+
+A few rules make stripping and relaunching safe against surprising saved argvs:
+
+- A flag's value is only consumed when the next token does not start with `-`;
+  otherwise only the flag itself is removed, so a following option is never
+  swallowed as if it were that flag's value.
+- `argv[0]` becomes the bare program name when its basename is the program (so
+  the program is looked up on `PATH` at restore time instead of a versioned
+  path that may have since been deleted); it is left alone otherwise, for
+  example when the saved command is a wrapper like `node`.
+- If the stripped argv still contains a token with whitespace or a `--` token,
+  the plain relaunch is used instead, so a prompt is never sent twice.
+- Session values must be non-empty, at most 512 characters, contain no control
+  characters, and not start with `-`.
 
 ## Components
 
@@ -307,7 +325,9 @@ written to a temporary file and renamed into place.
 2. If the status is not `working`, `blocked` or `done`, exit.
 3. `pane.get` for the pane's `agent_session`. If there is none, exit.
 4. Record "active now" for `<agent>:<session value>`, subject to the 60-second
-   skip.
+   skip. `working` always counts; `blocked` and `done` count only on a change
+   of status from the last status recorded for that session, because herdr
+   also fires this event when only a pane's title or labels change.
 
 ### Sweep (`sweep --if-due`)
 
@@ -351,11 +371,13 @@ The record is written before the tab is closed, so a failed close loses nothing.
    to its original path.
 3. Build the `layout.apply` tree from the saved layout. Each agent pane's
    `command` becomes
-   `["sh", "-c", "<relaunch argv>; exec \"${SHELL:-sh}\""]`, with every argument
-   shell-quoted. The relaunch argv is the saved launch argv with the agent's resume
-   tokens stripped and its resume arguments appended, or `<program> <resume args>`
-   when the agent's `relaunch` is `plain`. The shell wrapper leaves a usable shell
-   when the agent exits. Shell panes get no command and start a shell in their cwd.
+   `["sh", "-c", "trap : INT; <relaunch argv>; exec \"${SHELL:-sh}\""]`, with every
+   argument shell-quoted. The relaunch argv is the saved launch argv with the agent's
+   resume tokens stripped and its resume arguments appended, or `<program> <resume args>`
+   when the agent's `relaunch` is `plain`. The `trap` ignores SIGINT in the wrapper
+   shell itself, so a Ctrl-C aimed at the agent does not kill the pane before the
+   fallback shell can start. The shell wrapper leaves a usable shell when the agent
+   exits. Shell panes get no command and start a shell in their cwd.
 4. Apply with the saved tab label and `focus: true`.
 5. Set `restored_at` for each restored session and delete the archive entry.
 

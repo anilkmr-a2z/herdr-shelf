@@ -29,24 +29,48 @@ class ActivityStore:
         data = read_json(self.path, {})
         return data if isinstance(data, dict) else {}
 
-    def update(self, fn) -> None:
-        """Apply fn(data) under the lock; write unless fn returns False."""
+    def update(self, fn) -> bool:
+        """Apply fn(data) under the lock; write unless fn returns False.
+
+        Returns whether the write actually happened, so callers can tell
+        whether anything changed.
+        """
         with FileLock(self.lock_path, wait_seconds=5.0):
             data = self.load()
-            if fn(data) is not False:
+            changed = fn(data) is not False
+            if changed:
                 atomic_write_json(self.path, data)
+            return changed
 
 
 def touch(data: dict, key: str, now: datetime) -> bool:
-    """Record activity now. Skips the write when the last record is under 60s old."""
+    """Record activity now. Skips the write when the last record is under 60s
+    old. A last_active in the future (clock skew) is always overwritten."""
     rec = data.setdefault(key, {})
     changed = "first_seen" not in rec
     rec.setdefault("first_seen", iso(now))
     last = parse_iso(rec.get("last_active"))
-    if last is None or now - last >= TOUCH_SKIP:
+    if last is None or last > now or now - last >= TOUCH_SKIP:
         rec["last_active"] = iso(now)
         changed = True
     return changed
+
+
+def record_status(data: dict, key: str, status: str, now: datetime) -> bool:
+    """Record activity for one pane.agent_status_changed event, tracking
+    last_status per session. "working" always counts (subject to touch's own
+    60s skip); "blocked" and "done" count only when the status changed since
+    the last recorded status, because herdr also fires this event when only
+    a pane's title or labels change.
+    """
+    rec = data.setdefault(key, {})
+    prev_status = rec.get("last_status")
+    status_changed = status != prev_status
+    if status != "working" and not status_changed:
+        return False
+    touched = touch(data, key, now)
+    rec["last_status"] = status
+    return touched or status_changed
 
 
 def see(data: dict, key: str, now: datetime) -> bool:
@@ -73,10 +97,18 @@ def effective(rec: dict, history_ts: datetime | None) -> datetime | None:
 
 
 def track(client, store: ActivityStore, event_json: str | None, env_pane_id: str | None, now: datetime) -> bool:
-    """Handle one pane.agent_status_changed event. Returns True if activity was recorded."""
+    """Handle one pane.agent_status_changed event.
+
+    Returns whether activity.json was actually changed as a result.
+    """
     try:
-        data = json.loads(event_json or "{}").get("data") or {}
-    except (ValueError, AttributeError):
+        parsed = json.loads(event_json or "{}")
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    data = parsed.get("data")
+    if not isinstance(data, dict):
         return False
     status = data.get("agent_status")
     pane_id = data.get("pane_id") or env_pane_id
@@ -84,8 +116,7 @@ def track(client, store: ActivityStore, event_json: str | None, env_pane_id: str
         return False
     pane = client.call("pane.get", {"pane_id": pane_id}).get("pane") or {}
     session = pane.get("agent_session")
-    if not session or not session.get("agent") or not session.get("value"):
+    if not isinstance(session, dict) or not session.get("agent") or not session.get("value"):
         return False
     key = session_key(session["agent"], session["value"])
-    store.update(lambda d: touch(d, key, now))
-    return True
+    return store.update(lambda d: record_status(d, key, status, now))

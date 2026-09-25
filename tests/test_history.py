@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,24 @@ class ClaudeTest(unittest.TestCase):
     def test_session_paths_empty_when_missing(self):
         self.assertEqual(history.claude_session_paths("nope"), [])
 
+    def test_rejects_a_session_id_that_traverses_out_of_the_projects_dir(self):
+        self.assertIsNone(history.claude_session_file("../../outside/secret"))
+        self.assertEqual(history.claude_session_paths("../../outside/secret"), [])
+
+    def test_rejects_a_session_id_containing_a_path_separator(self):
+        self.assertIsNone(history.claude_session_file("a/b"))
+
+    def test_newest_by_mtime_wins_when_several_files_match(self):
+        alphabetically_first = self.home / "projects" / "-proj-aaa" / "S3.jsonl"
+        alphabetically_second = self.home / "projects" / "-proj-zzz" / "S3.jsonl"
+        write_jsonl(alphabetically_first, [{"type": "user", "timestamp": "2026-09-01T10:00:00Z"}])
+        write_jsonl(alphabetically_second, [{"type": "user", "timestamp": "2026-09-01T10:00:00Z"}])
+        now = time.time()
+        # The alphabetically-first path gets the older mtime, so a naive sort would pick the wrong one.
+        os.utime(alphabetically_first, (now - 1000, now - 1000))
+        os.utime(alphabetically_second, (now, now))
+        self.assertEqual(history.claude_session_file("S3"), alphabetically_second)
+
 
 class CodexTest(unittest.TestCase):
     def setUp(self):
@@ -70,10 +89,33 @@ class CodexTest(unittest.TestCase):
         self.assertEqual(history.last_activity("codex", "C1"),
                          datetime(2026, 8, 1, 5, 7, 50, 770000, tzinfo=timezone.utc))
 
+    def test_rejects_a_session_id_that_traverses_out_of_the_sessions_dir(self):
+        self.assertIsNone(history.codex_session_file("../../outside/secret"))
+
+    def test_rejects_a_session_id_containing_a_path_separator(self):
+        self.assertIsNone(history.codex_session_file("a/b"))
+
+    def test_newest_by_mtime_wins_when_several_files_match(self):
+        alphabetically_first = self.home / "sessions" / "2026" / "07" / "01" / "rollout-2026-07-01T00-00-00-C2.jsonl"
+        alphabetically_second = self.home / "sessions" / "2026" / "08" / "01" / "rollout-2026-08-01T00-00-00-C2.jsonl"
+        write_jsonl(alphabetically_first, [{"type": "response_item", "timestamp": "2026-07-01T00:00:00Z"}])
+        write_jsonl(alphabetically_second, [{"type": "response_item", "timestamp": "2026-08-01T00:00:00Z"}])
+        now = time.time()
+        # The alphabetically-later path gets the older mtime, so a naive sort would pick the wrong one.
+        os.utime(alphabetically_second, (now - 1000, now - 1000))
+        os.utime(alphabetically_first, (now, now))
+        self.assertEqual(history.codex_session_file("C2"), alphabetically_first)
+
 
 class NoReaderTest(unittest.TestCase):
     def test_agent_without_reader(self):
         self.assertIsNone(history.last_activity("pi", "X"))
+
+
+class LastActivityErrorHandlingTest(unittest.TestCase):
+    def test_catches_any_exception_from_a_reader_not_only_oserror(self):
+        with mock.patch.dict(history.READERS, {"claude": mock.Mock(side_effect=ValueError("boom"))}):
+            self.assertIsNone(history.last_activity("claude", "S1"))
 
 
 if __name__ == "__main__":

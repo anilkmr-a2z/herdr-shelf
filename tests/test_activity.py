@@ -38,6 +38,47 @@ class RecordTest(unittest.TestCase):
         activity.mark_restored(d, "k", T0)
         self.assertEqual(d["k"]["restored_at"], "2026-09-24T12:00:00Z")
 
+    def test_touch_overwrites_a_last_active_that_is_in_the_future(self):
+        d = {"k": {"first_seen": stamp(T0), "last_active": stamp(T0 + timedelta(hours=1))}}
+        # Without the clock-skew guard, "now - last_active" is negative and
+        # smaller than the 60s skip window, so the stale future value would stick.
+        self.assertTrue(activity.touch(d, "k", T0))
+        self.assertEqual(d["k"]["last_active"], "2026-09-24T12:00:00Z")
+
+
+class RecordStatusTest(unittest.TestCase):
+    def test_done_then_done_again_does_not_move_last_active(self):
+        d = {}
+        self.assertTrue(activity.record_status(d, "k", "done", T0))
+        first_active = d["k"]["last_active"]
+        self.assertFalse(activity.record_status(d, "k", "done", T0 + timedelta(seconds=120)))
+        self.assertEqual(d["k"]["last_active"], first_active)
+        self.assertEqual(d["k"]["last_status"], "done")
+
+    def test_done_working_done_counts_both_done_calls(self):
+        d = {}
+        self.assertTrue(activity.record_status(d, "k", "done", T0))
+        self.assertEqual(d["k"]["last_active"], stamp(T0))
+        t1 = T0 + timedelta(seconds=120)
+        self.assertTrue(activity.record_status(d, "k", "working", t1))
+        self.assertEqual(d["k"]["last_active"], stamp(t1))
+        t2 = t1 + timedelta(seconds=120)
+        self.assertTrue(activity.record_status(d, "k", "done", t2))
+        self.assertEqual(d["k"]["last_active"], stamp(t2))
+
+    def test_blocked_then_blocked_again_does_not_move_last_active(self):
+        d = {}
+        self.assertTrue(activity.record_status(d, "k", "blocked", T0))
+        first_active = d["k"]["last_active"]
+        self.assertFalse(activity.record_status(d, "k", "blocked", T0 + timedelta(seconds=120)))
+        self.assertEqual(d["k"]["last_active"], first_active)
+
+    def test_working_always_counts_subject_to_the_60s_skip(self):
+        d = {}
+        self.assertTrue(activity.record_status(d, "k", "working", T0))
+        self.assertFalse(activity.record_status(d, "k", "working", T0 + timedelta(seconds=30)))
+        self.assertTrue(activity.record_status(d, "k", "working", T0 + timedelta(seconds=61)))
+
 
 class EffectiveTest(unittest.TestCase):
     def test_history_replaces_first_seen(self):
@@ -92,6 +133,23 @@ class StoreAndTrackTest(unittest.TestCase):
     def test_garbage_event_is_ignored(self):
         self.assertFalse(activity.track(Client(self.fake.path), self.store, "not json", None, T0))
         self.assertFalse(activity.track(Client(self.fake.path), self.store, None, None, T0))
+
+    def test_non_dict_data_is_ignored(self):
+        ev = json.dumps({"event": "pane.agent_status_changed", "data": ["nope"]})
+        self.assertFalse(activity.track(Client(self.fake.path), self.store, ev, None, T0))
+        self.assertEqual(self.store.load(), {})
+        self.assertEqual(self.fake.calls, [])
+
+    def test_non_dict_agent_session_is_ignored(self):
+        self.fake.handlers["pane.get"] = lambda p: {"pane": {"pane_id": p["pane_id"], "agent_session": "claude:S"}}
+        self.assertFalse(activity.track(Client(self.fake.path), self.store, self.event("done"), None, T0))
+        self.assertEqual(self.store.load(), {})
+
+    def test_return_value_reflects_whether_the_store_actually_changed(self):
+        client = Client(self.fake.path)
+        self.assertTrue(activity.track(client, self.store, self.event("working"), None, T0))
+        # Same session, same status, well within the 60s skip: no write happens.
+        self.assertFalse(activity.track(client, self.store, self.event("working"), None, T0 + timedelta(seconds=1)))
 
 
 if __name__ == "__main__":

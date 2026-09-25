@@ -5,10 +5,18 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
 from .util import parse_iso
+
+# Session ids come from agent_session values reported by herdr (or read back
+# from our own records), but they end up embedded in filesystem glob patterns,
+# so a malformed or malicious one must not be able to read outside the
+# expected directory (e.g. "../../outside/secret") or contain a path
+# separator (e.g. "a/b").
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def claude_home() -> Path:
@@ -19,10 +27,24 @@ def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
 
+def _valid_session_id(session_id: str) -> bool:
+    return isinstance(session_id, str) and bool(_SESSION_ID_RE.match(session_id))
+
+
+def _newest(matches: list[str]) -> Path | None:
+    """The match with the latest mtime, or None. Several files can share a
+    session id across projects or after a rename; the newest one is the
+    session that is actually still in use."""
+    if not matches:
+        return None
+    return max((Path(m) for m in matches), key=lambda p: p.stat().st_mtime)
+
+
 def claude_session_file(session_id: str) -> Path | None:
+    if not _valid_session_id(session_id):
+        return None
     pattern = str(claude_home() / "projects" / "*" / f"{glob.escape(session_id)}.jsonl")
-    matches = sorted(glob.glob(pattern))
-    return Path(matches[0]) if matches else None
+    return _newest(glob.glob(pattern))
 
 
 def claude_session_paths(session_id: str) -> list[Path]:
@@ -38,9 +60,10 @@ def claude_session_paths(session_id: str) -> list[Path]:
 
 
 def codex_session_file(session_id: str) -> Path | None:
+    if not _valid_session_id(session_id):
+        return None
     pattern = str(codex_home() / "sessions" / "**" / f"rollout-*-{glob.escape(session_id)}.jsonl")
-    matches = sorted(glob.glob(pattern, recursive=True))
-    return Path(matches[-1]) if matches else None
+    return _newest(glob.glob(pattern, recursive=True))
 
 
 def _last_timestamp(path: Path, keep) -> datetime | None:
@@ -87,5 +110,5 @@ def last_activity(agent: str, session_value: str) -> datetime | None:
         return None
     try:
         return reader(session_value)
-    except OSError:
+    except Exception:
         return None

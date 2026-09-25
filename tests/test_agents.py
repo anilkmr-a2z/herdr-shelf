@@ -63,7 +63,7 @@ class RelaunchTest(unittest.TestCase):
     def test_keeps_flags_and_strips_old_resume(self):
         saved = ["/usr/local/bin/claude", "--agent", "reviewer", "--resume", "OLD", "--effort", "max"]
         self.assertEqual(agents.relaunch_argv("claude", self.t["claude"], "NEW", saved),
-                         ["/usr/local/bin/claude", "--agent", "reviewer", "--effort", "max", "--resume", "NEW"])
+                         ["claude", "--agent", "reviewer", "--effort", "max", "--resume", "NEW"])
 
     def test_strips_equals_form_aliases_and_bare_flags(self):
         saved = ["claude", "--resume=OLD", "-r", "OLD2", "-c", "--continue", "--model", "opus"]
@@ -88,6 +88,109 @@ class RelaunchTest(unittest.TestCase):
     def test_argv0_never_stripped(self):
         self.assertEqual(agents.strip_resume(["-c", "x"], self.t["claude"]), ["-c", "x"])
 
+    def test_claude_strips_session_id_and_fork_session(self):
+        saved = ["claude", "--session-id", "OLD-ID", "--fork-session", "--model", "opus"]
+        self.assertEqual(agents.relaunch_argv("claude", self.t["claude"], "NEW", saved),
+                         ["claude", "--model", "opus", "--resume", "NEW"])
+
+
+class OptionalValueTest(unittest.TestCase):
+    """A value-taking flag or subcommand only consumes a following token that
+    does not itself look like a flag, so a following option is not swallowed."""
+
+    def setUp(self):
+        self.t = agents.table()
+
+    def test_value_flag_without_a_following_value_is_not_swallowed(self):
+        saved = ["claude", "-r", "--effort", "max"]
+        self.assertEqual(agents.relaunch_argv("claude", self.t["claude"], "NEW", saved),
+                         ["claude", "--effort", "max", "--resume", "NEW"])
+
+    def test_subcommand_without_a_following_value_is_not_swallowed(self):
+        saved = ["codex", "resume", "-m", "o3"]
+        self.assertEqual(agents.relaunch_argv("codex", self.t["codex"], "NEW", saved),
+                         ["codex", "-m", "o3", "resume", "NEW"])
+
+
+class ArgvZeroTest(unittest.TestCase):
+    def setUp(self):
+        self.t = agents.table()
+
+    def test_rewritten_to_bare_program_name_when_basename_matches(self):
+        saved = ["/opt/versioned/claude", "--model", "opus"]
+        self.assertEqual(agents.relaunch_argv("claude", self.t["claude"], "NEW", saved),
+                         ["claude", "--model", "opus", "--resume", "NEW"])
+
+    def test_left_alone_for_a_wrapper(self):
+        saved = ["node", "/opt/claude-cli.js", "--model", "opus"]
+        self.assertEqual(agents.relaunch_argv("claude", self.t["claude"], "NEW", saved),
+                         ["node", "/opt/claude-cli.js", "--model", "opus", "--resume", "NEW"])
+
+
+class PromptGuardTest(unittest.TestCase):
+    """A saved argv that still looks like it carries a prompt after stripping
+    falls back to a plain relaunch, so the prompt is never sent again."""
+
+    def setUp(self):
+        self.t = agents.table()
+
+    def test_positional_prompt_with_whitespace_forces_plain(self):
+        saved = ["claude", "--dangerously-skip-permissions", "fix the build"]
+        self.assertEqual(agents.relaunch_argv("claude", self.t["claude"], "NEW", saved),
+                         ["claude", "--resume", "NEW"])
+
+    def test_codex_positional_prompt_forces_plain(self):
+        saved = ["codex", "resume", "OLD", "keep going"]
+        self.assertEqual(agents.relaunch_argv("codex", self.t["codex"], "NEW", saved),
+                         ["codex", "resume", "NEW"])
+
+    def test_double_dash_forces_plain(self):
+        saved = ["claude", "--", "foo"]
+        self.assertEqual(agents.relaunch_argv("claude", self.t["claude"], "NEW", saved),
+                         ["claude", "--resume", "NEW"])
+
+    def test_flags_without_whitespace_are_kept(self):
+        saved = ["claude", "--effort", "max"]
+        self.assertEqual(agents.relaunch_argv("claude", self.t["claude"], "NEW", saved),
+                         ["claude", "--effort", "max", "--resume", "NEW"])
+
+    def test_warns_when_falling_back(self):
+        saved = ["claude", "fix the build"]
+        with self.assertLogs("shelf", level="WARNING"):
+            agents.relaunch_argv("claude", self.t["claude"], "NEW", saved)
+
+
+class ValidSessionValueTest(unittest.TestCase):
+    def test_empty_or_non_string_is_invalid(self):
+        self.assertFalse(agents.valid_session_value("claude", ""))
+        self.assertFalse(agents.valid_session_value("claude", None))
+        self.assertFalse(agents.valid_session_value("claude", 123))
+
+    def test_too_long_is_invalid(self):
+        self.assertFalse(agents.valid_session_value("claude", "x" * 513))
+        self.assertTrue(agents.valid_session_value("claude", "x" * 512))
+
+    def test_control_characters_are_invalid(self):
+        self.assertFalse(agents.valid_session_value("claude", "abc\ndef"))
+        self.assertFalse(agents.valid_session_value("claude", "abc\x7fdef"))
+
+    def test_leading_dash_is_invalid(self):
+        self.assertFalse(agents.valid_session_value("claude", "-rf"))
+
+    def test_ordinary_value_is_valid(self):
+        self.assertTrue(agents.valid_session_value("claude", "abc-123"))
+
+    def test_letta_default_form_needs_a_non_empty_remainder(self):
+        self.assertTrue(agents.valid_session_value("letta", "default:agent-7"))
+        self.assertFalse(agents.valid_session_value("letta", "default:"))
+
+    def test_relaunch_argv_raises_for_invalid_value(self):
+        t = agents.table()
+        with self.assertRaises(ValueError):
+            agents.relaunch_argv("claude", t["claude"], "-rf", None)
+        with self.assertRaises(ValueError):
+            agents.relaunch_argv("claude", t["claude"], "", None)
+
 
 class ProgramMatchTest(unittest.TestCase):
     def test_basename(self):
@@ -101,8 +204,9 @@ class ShellCommandTest(unittest.TestCase):
         argv = ["printf", "%s|", "it's", "a b", '"q"', "$HOME"]
         cmd = agents.shell_command(argv)
         self.assertEqual(cmd[:2], ["sh", "-c"])
+        self.assertTrue(cmd[2].startswith("trap : INT; "))
         self.assertTrue(cmd[2].endswith('; exec "${SHELL:-sh}"'))
-        script = cmd[2][: -len('; exec "${SHELL:-sh}"')]
+        script = cmd[2][len("trap : INT; ") : -len('; exec "${SHELL:-sh}"')]
         out = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=True).stdout
         self.assertEqual(out, 'it\'s|a b|"q"|$HOME|')
 

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
+
+_LOG = logging.getLogger("shelf")
 
 # Mirrors herdr's src/agent_resume.rs: the commands herdr itself uses to resume
 # agent sessions after a server restart. herdr does not expose them through its
@@ -16,7 +19,12 @@ import shlex
 # strip_bare:       extra flags without a value, removed from a saved launch argv
 # strip_subcommand: a subcommand plus its argument, removed from a saved launch argv
 BUILTIN = {
-    "claude": {"program": "claude", "resume": ["--resume", "{id}"], "strip": ["-r"], "strip_bare": ["--continue", "-c"]},
+    "claude": {
+        "program": "claude",
+        "resume": ["--resume", "{id}"],
+        "strip": ["-r", "--session-id"],
+        "strip_bare": ["--continue", "-c", "--fork-session"],
+    },
     "codex": {"program": "codex", "resume": ["resume", "{id}"], "strip_subcommand": "resume"},
     "copilot": {"program": "copilot", "resume": ["--resume={id}"]},
     "devin": {"program": "devin", "resume": ["--resume", "{id}"]},
@@ -62,7 +70,13 @@ def _own_flag(entry: dict) -> str | None:
 
 
 def strip_resume(argv: list[str], entry: dict) -> list[str]:
-    """Remove any previous resume or continue arguments. argv[0] is never touched."""
+    """Remove any previous resume or continue arguments. argv[0] is never touched.
+
+    A value-taking flag (or a strip_subcommand) only consumes the following
+    token when one exists and it does not itself look like a flag; otherwise
+    only the flag/subcommand token itself is removed, so a following option
+    is never swallowed.
+    """
     value_flags = set(entry.get("strip", []))
     own = _own_flag(entry)
     if own:
@@ -74,7 +88,8 @@ def strip_resume(argv: list[str], entry: dict) -> list[str]:
     while i < len(argv):
         tok = argv[i]
         if tok in value_flags or (subcommand and tok == subcommand):
-            i += 2
+            has_value = i + 1 < len(argv) and not argv[i + 1].startswith("-")
+            i += 2 if has_value else 1
             continue
         if tok in bare or any(tok.startswith(flag + "=") for flag in value_flags):
             i += 1
@@ -84,11 +99,42 @@ def strip_resume(argv: list[str], entry: dict) -> list[str]:
     return out
 
 
+def valid_session_value(agent: str, value: object) -> bool:
+    """Whether value is safe to substitute into a relaunch command.
+
+    Must be a non-empty string of at most 512 characters, with no control
+    characters, and not starting with "-" (which could be read as a flag).
+    letta's "default:<agent-id>" form additionally needs a non-empty
+    <agent-id>.
+    """
+    if not isinstance(value, str) or not value or len(value) > 512:
+        return False
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        return False
+    if value.startswith("-"):
+        return False
+    if agent == "letta" and value.startswith("default:"):
+        return len(value) > len("default:")
+    return True
+
+
+def _looks_like_a_prompt(tokens: list[str]) -> bool:
+    return any(tok == "--" or any(ch.isspace() for ch in tok) for tok in tokens)
+
+
 def relaunch_argv(agent: str, entry: dict, session_value: str, launch_argv: list[str] | None) -> list[str]:
+    if not valid_session_value(agent, session_value):
+        raise ValueError(f"invalid session value for {agent!r}: {session_value!r}")
     args = resume_args(agent, entry, session_value)
     if entry.get("relaunch") == "plain" or not launch_argv:
         return [entry["program"], *args]
-    return [*strip_resume(list(launch_argv), entry), *args]
+    stripped = strip_resume(list(launch_argv), entry)
+    if matches_program(entry, stripped[0]):
+        stripped[0] = entry["program"]
+    if _looks_like_a_prompt(stripped[1:]):
+        _LOG.warning("saved command for %s looked like it carried a prompt; using a plain relaunch", agent)
+        return [entry["program"], *args]
+    return [*stripped, *args]
 
 
 def matches_program(entry: dict, argv0: str) -> bool:
@@ -96,5 +142,9 @@ def matches_program(entry: dict, argv0: str) -> bool:
 
 
 def shell_command(argv: list[str]) -> list[str]:
-    """Run argv, then leave an interactive shell in the pane when it exits."""
-    return ["sh", "-c", shlex.join(argv) + '; exec "${SHELL:-sh}"']
+    """Run argv, then leave an interactive shell in the pane when it exits.
+
+    The trap ignores SIGINT in the wrapper shell itself, so a Ctrl-C aimed at
+    the agent does not kill the pane before the fallback shell can start.
+    """
+    return ["sh", "-c", "trap : INT; " + shlex.join(argv) + '; exec "${SHELL:-sh}"']
