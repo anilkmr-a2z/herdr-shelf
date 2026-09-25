@@ -10,6 +10,8 @@ from pathlib import Path
 from unittest import mock
 
 from shelf.__main__ import main
+from shelf.api import HerdrError
+from shelf.util import FileLock
 from tests.fakeherdr import FakeError, FakeHerdr
 
 
@@ -17,7 +19,15 @@ class MainTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        env = mock.patch.dict(os.environ, {"HERDR_PLUGIN_STATE_DIR": self.tmp.name})
+        # XDG_CONFIG_HOME/XDG_STATE_HOME are pointed at fresh temp subdirectories
+        # (not derived from the real HOME) so a test that forgets to set
+        # HERDR_PLUGIN_CONFIG_DIR never falls through to the developer's own
+        # ~/.config or ~/.local/state and reads a real herdr plugin config/state.
+        env = mock.patch.dict(os.environ, {
+            "HERDR_PLUGIN_STATE_DIR": self.tmp.name,
+            "XDG_CONFIG_HOME": os.path.join(self.tmp.name, "xdg-config"),
+            "XDG_STATE_HOME": os.path.join(self.tmp.name, "xdg-state"),
+        })
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("HERDR_SOCKET_PATH", None)
@@ -35,6 +45,20 @@ class MainTest(unittest.TestCase):
             handler.close()
         shelf_log.handlers = []
 
+    def test_developer_home_config_is_never_read(self):
+        # A config.json sitting under a "real-looking" ~/.config path (as it
+        # would on a developer's own machine) must never be consulted: setUp
+        # points XDG_CONFIG_HOME elsewhere, so HOME alone must not matter.
+        fake_home = os.path.join(self.tmp.name, "developer-home")
+        broken_config_dir = Path(fake_home) / ".config" / "herdr" / "plugins" / "config" / "anilkmr.shelf"
+        broken_config_dir.mkdir(parents=True)
+        (broken_config_dir / "config.json").write_text("{not valid json")
+        os.environ.pop("HERDR_PLUGIN_CONFIG_DIR", None)
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": fake_home}), redirect_stderr(err):
+            self.assertEqual(main(["sweep", "--if-due"]), 0)
+        self.assertNotIn("Expecting property name", err.getvalue())
+
     def test_hooks_exit_zero_without_herdr(self):
         for argv in (["track"], ["sweep", "--if-due"], ["open-picker"]):
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
@@ -51,6 +75,15 @@ class MainTest(unittest.TestCase):
         log_path = Path(self.tmp.name) / "shelf.log"
         self.assertTrue(log_path.exists())
         self.assertIn("track", log_path.read_text())
+
+    def test_pick_failure_is_logged(self):
+        # No HERDR_SOCKET_PATH is set, so Client() raises inside _pick;
+        # that failure must be logged (with a traceback), not just printed.
+        with mock.patch("builtins.input", side_effect=EOFError), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["pick"]), 0)
+        log_path = Path(self.tmp.name) / "shelf.log"
+        self.assertTrue(log_path.exists())
+        self.assertIn("pick failed", log_path.read_text())
 
     def test_unknown_command(self):
         with redirect_stderr(io.StringIO()):
@@ -101,6 +134,19 @@ class MainTest(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("no archived tab '20260101T000000Z-abcdef'", err.getvalue())
             self.assertIn("python3 -m shelf list", err.getvalue())
+
+    def test_restore_other_keyerrors_are_not_mistaken_for_a_missing_entry(self):
+        archive_dir = Path(self.tmp.name) / "archive" / "20260101T000000Z-abcdef"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "record.json").write_text(json.dumps({
+            "id": "20260101T000000Z-abcdef", "archived_at": "2026-01-01T00:00:00Z",
+            "tab": {"label": "demo"}, "workspace": {"label": None}, "panes": {},
+        }))
+        with mock.patch("shelf.__main__.restore.restore", side_effect=KeyError("weird")), \
+                mock.patch("shelf.__main__.Client"), redirect_stderr(io.StringIO()) as err:
+            code = main(["restore", "20260101T000000Z-abcdef"])
+        self.assertEqual(code, 1)
+        self.assertNotIn("no archived tab", err.getvalue())
 
     def test_state_dir_defaults_to_the_herdr_style_path(self):
         os.environ.pop("HERDR_PLUGIN_STATE_DIR", None)
@@ -174,6 +220,47 @@ class MainTest(unittest.TestCase):
                 calls = [c for c in client.call.call_args_list if c.args[0] == "notification.show"]
                 self.assertEqual(len(calls), 2)
 
+    def test_manual_sweep_config_error_also_notifies(self):
+        config_dir = os.path.join(self.tmp.name, "config")
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as f:
+            f.write('{"idle_days": -1}')
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_CONFIG_DIR": config_dir}):
+            with mock.patch("shelf.__main__.Client") as client_cls, redirect_stderr(io.StringIO()):
+                client = client_cls.return_value
+                self.assertEqual(main(["sweep"]), 1)  # manual sweep is not a hook: exit 1
+                calls = [c for c in client.call.call_args_list if c.args[0] == "notification.show"]
+                self.assertEqual(len(calls), 1)
+                self.assertIn("shelf: config.json is invalid", calls[0].args[1]["body"])
+
+    def test_config_error_notification_skips_silently_when_lock_is_busy(self):
+        config_dir = os.path.join(self.tmp.name, "config")
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as f:
+            f.write('{"idle_days": -1}')
+        with FileLock(Path(self.tmp.name) / "config-error.lock"):
+            with mock.patch.dict(os.environ, {"HERDR_PLUGIN_CONFIG_DIR": config_dir}):
+                with mock.patch("shelf.__main__.Client") as client_cls, redirect_stderr(io.StringIO()):
+                    self.assertEqual(main(["sweep", "--if-due"]), 0)
+                    client_cls.return_value.call.assert_not_called()
+
+    def test_config_error_marker_is_not_touched_when_notification_fails(self):
+        config_dir = os.path.join(self.tmp.name, "config")
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as f:
+            f.write('{"idle_days": -1}')
+        marker = Path(self.tmp.name) / "config-error-notified"
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_CONFIG_DIR": config_dir}):
+            with mock.patch("shelf.__main__.Client") as client_cls, redirect_stderr(io.StringIO()):
+                client_cls.return_value.call.side_effect = HerdrError("unavailable", "no herdr")
+                self.assertEqual(main(["sweep", "--if-due"]), 0)
+                self.assertFalse(marker.exists())
+                # notification still fails, but since the marker was never
+                # touched, this is not rate-limited: it tries again.
+                self.assertEqual(main(["sweep", "--if-due"]), 0)
+                calls = [c for c in client_cls.return_value.call.call_args_list if c.args[0] == "notification.show"]
+                self.assertEqual(len(calls), 2)
+
     def test_open_picker_sends_the_plugin_pane_open_payload(self):
         fake = FakeHerdr()
         self.addCleanup(fake.close)
@@ -195,7 +282,8 @@ class MainTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}):
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(main(["open-picker"]), 0)
-        self.assertIn(("notification.show", {"title": "shelf", "body": "shelf: close the open popup first"}),
+        self.assertIn(("notification.show",
+                       {"title": "shelf", "body": "shelf: close the open popup or dialog first"}),
                       fake.calls)
 
 

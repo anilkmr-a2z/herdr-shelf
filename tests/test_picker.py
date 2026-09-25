@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 from shelf import picker
 
@@ -117,6 +118,27 @@ class RunTest(unittest.TestCase):
         _, restored, out, _ = self.run_picker(["9", "1"])
         self.assertIn("Not a valid choice.", out)
         self.assertEqual(restored, ["b"])
+
+    def test_invalid_choice_message_survives_the_next_render(self):
+        # "Not a valid choice." must not be printed until *after* the next
+        # render pass, so a screen clear before that render never erases it.
+        arch = FakeArchive(RECORDS)
+        calls = []
+        answers = iter(["9", "q"])
+        picker.run(arch, lambda archive_id: {"tab_id": "t", "warnings": []}, lambda: T0,
+                   input_fn=lambda prompt: next(answers), print_fn=calls.append)
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("Not a valid choice.", calls[0])
+        self.assertEqual(calls[2], "Not a valid choice.")
+
+    def test_clears_the_real_screen_via_stdout_write_when_a_tty(self):
+        arch = FakeArchive(RECORDS)
+        answers = iter(["q"])
+        with mock.patch("shelf.picker.sys.stdout") as stdout:
+            stdout.isatty.return_value = True
+            picker.run(arch, lambda archive_id: {"tab_id": "t", "warnings": []}, lambda: T0,
+                       input_fn=lambda prompt: next(answers), print_fn=lambda *_: None)
+        stdout.write.assert_called_once_with(picker.CLEAR_SCREEN)
 
     def test_failed_restore_keeps_picker_open(self):
         _, _, out, _ = self.run_picker(["1", "", "q"], restore_error=RuntimeError("boom"))

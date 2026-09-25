@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import activity, agents, archive, config, picker, restore, sweep
 from .api import Client, HerdrError
-from .util import LockBusy, now, parse_iso
+from .util import FileLock, LockBusy, now, parse_iso
 
 PLUGIN_ID = "anilkmr.shelf"
 ALWAYS_HOOKS = ("track", "open-picker")
@@ -75,22 +75,36 @@ def _setup_logging(state: Path) -> None:
 
 
 def _notify_config_error(state: Path, message: str) -> None:
-    """At most one 'config.json is invalid' notification per hour."""
-    marker = state / "config-error-notified"
+    """At most one 'config.json is invalid' notification per hour.
+
+    The check-and-touch is guarded by a lock so two processes racing on the
+    same broken config (e.g. a hook and a manual sweep) do not both notify;
+    a process that cannot get the lock skips silently rather than waiting.
+    The marker is only touched once notification.show actually succeeds, so
+    a herdr-unavailable failure is not mistaken for a delivered notification
+    and is retried on the next occurrence instead of being rate-limited.
+    """
     try:
-        if marker.exists() and time.time() - marker.stat().st_mtime < CONFIG_ERROR_NOTIFY_INTERVAL_SECONDS:
-            return
-    except OSError:
-        pass
-    try:
-        Client().call("notification.show", {"title": "shelf", "body": f"shelf: config.json is invalid: {message}"})
-    except HerdrError as e:
-        log.warning("notification failed: %s", e)
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.touch(exist_ok=True)
-    except OSError:
-        pass
+        with FileLock(state / "config-error.lock"):
+            marker = state / "config-error-notified"
+            try:
+                if marker.exists() and time.time() - marker.stat().st_mtime < CONFIG_ERROR_NOTIFY_INTERVAL_SECONDS:
+                    return
+            except OSError:
+                pass
+            try:
+                Client().call("notification.show",
+                              {"title": "shelf", "body": f"shelf: config.json is invalid: {message}"})
+            except HerdrError as e:
+                log.warning("notification failed: %s", e)
+                return
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.touch(exist_ok=True)
+            except OSError:
+                pass
+    except LockBusy:
+        pass  # another process is already handling this config error
 
 
 def _describe(rec: dict, moment) -> str:
@@ -116,7 +130,7 @@ def main(argv=None) -> int:
         return _dispatch(command, args, state)
     except config.ConfigError as e:
         log.error("%s: %s", command or "shelf", e)
-        if is_hook:
+        if is_hook or command == "sweep":
             _notify_config_error(state, str(e))
         return 0 if is_hook else 1
     except (HerdrError, archive.Skip, LockBusy) as e:
@@ -159,6 +173,7 @@ def _pick(state: Path) -> int:
     except (EOFError, KeyboardInterrupt):
         pass
     except Exception as e:
+        log.exception("pick failed")
         print(f"shelf: {e}", file=sys.stderr)
         try:
             input("Press Enter to close. ")
@@ -194,7 +209,8 @@ def _dispatch(command: str, args: list, state: Path) -> int:
         except HerdrError as e:
             if e.code == "ui_busy":
                 try:
-                    client.call("notification.show", {"title": "shelf", "body": "shelf: close the open popup first"})
+                    client.call("notification.show",
+                                {"title": "shelf", "body": "shelf: close the open popup or dialog first"})
                 except HerdrError:
                     pass
                 return 0
@@ -217,15 +233,16 @@ def _dispatch(command: str, args: list, state: Path) -> int:
         print(sweep.archive_now(Client(), cfg, state, table, args[0]))
         return 0
     if command == "restore":
-        cfg = config.load(_config_dir())
-        table = agents.table(cfg["agents"])
         arch = archive.Archive(state)
-        store = activity.ActivityStore(state)
         try:
-            result = restore.restore(Client(), arch, store, args[0], table, now())
+            arch.load(args[0])  # existence check only; any other error follows the normal path
         except KeyError:
             print(f"no archived tab '{args[0]}'; see `python3 -m shelf list`", file=sys.stderr)
             return 1
+        cfg = config.load(_config_dir())
+        table = agents.table(cfg["agents"])
+        store = activity.ActivityStore(state)
+        result = restore.restore(Client(), arch, store, args[0], table, now())
         for warning in result["warnings"]:
             print(warning)
         print(result["tab_id"] or "")

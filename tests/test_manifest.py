@@ -19,7 +19,7 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(m["min_herdr_version"], "0.9.0")
         self.assertEqual({a["id"] for a in m["actions"]}, {"restore", "sweep-now"})
         self.assertEqual({e["on"] for e in m["events"]},
-                         {"pane.agent_status_changed", "tab.focused", "workspace.focused"})
+                         {"pane.agent_status_changed", "workspace.focused"})
         self.assertEqual(m["panes"][0]["id"], "picker")
         self.assertEqual(m["panes"][0]["placement"], "popup")
 

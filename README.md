@@ -74,10 +74,11 @@ their tabs qualify no earlier than `idle_days` after install.
 ## Restore
 
 Press your picker key. The popup lists archived tabs, newest first, as many
-as fit the popup; run `python3 -m shelf list` to see the rest. Type a number
-to restore one, `d <number>` to delete one, `q` to close, or Esc to close.
-Deleting asks for confirmation (`[y/N]`, default no) and is permanent: there
-is no undo.
+as fit the popup. When more archived tabs exist than fit, restore the rest
+with `python3 -m shelf restore <id>` (ids from `python3 -m shelf list`). Type
+a number to restore one, `d <number>` to delete one, `q` to close, or Esc
+then Enter to close. Deleting asks for confirmation (`[y/N]`, default no) and
+is permanent: there is no undo.
 
 A restored tab goes back to the workspace with the same name (recreated if it
 is gone) with the same splits, labels and directories. Each agent is started

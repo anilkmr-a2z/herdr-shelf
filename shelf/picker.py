@@ -91,11 +91,18 @@ def _restore_sigint(previous) -> None:
 
 
 def run(arch, do_restore, now_fn, input_fn=input, print_fn=print, notify=lambda title, body: None) -> None:
+    pending_message = None
     while True:
         records = arch.list()
         if sys.stdout.isatty():
-            print_fn(CLEAR_SCREEN)
+            # Written directly, bypassing print_fn: a real clear must not add
+            # the trailing newline print() would, and pending_message below
+            # is what needs to reach print_fn just above the next prompt.
+            sys.stdout.write(CLEAR_SCREEN)
         print_fn("\n".join(render(records, now_fn())))
+        if pending_message:
+            print_fn(pending_message)
+            pending_message = None
         if not records:
             input_fn("Press Enter to close. ")
             return
@@ -104,7 +111,9 @@ def run(arch, do_restore, now_fn, input_fn=input, print_fn=print, notify=lambda 
         if choice == "quit":
             return
         if choice == "invalid":
-            print_fn("Not a valid choice.")
+            # Held until the next render (above) instead of printed here, so
+            # a screen clear on the next loop does not erase it unseen.
+            pending_message = "Not a valid choice."
             continue
         record = records[index]
         if choice == "delete":

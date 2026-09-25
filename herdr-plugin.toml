@@ -13,10 +13,6 @@ on = "pane.agent_status_changed"
 command = ["python3", "-m", "shelf", "track"]
 
 [[events]]
-on = "tab.focused"
-command = ["python3", "-m", "shelf", "sweep", "--if-due"]
-
-[[events]]
 on = "workspace.focused"
 command = ["python3", "-m", "shelf", "sweep", "--if-due"]
 
@@ -37,5 +33,5 @@ id = "picker"
 title = "Shelf"
 placement = "popup"
 width = "80%"
-height = 20
+height = "80%"
 command = ["python3", "-m", "shelf", "pick"]

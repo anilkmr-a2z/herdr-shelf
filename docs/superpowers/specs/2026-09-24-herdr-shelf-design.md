@@ -221,10 +221,6 @@ on = "pane.agent_status_changed"
 command = ["python3", "-m", "shelf", "track"]
 
 [[events]]
-on = "tab.focused"
-command = ["python3", "-m", "shelf", "sweep", "--if-due"]
-
-[[events]]
 on = "workspace.focused"
 command = ["python3", "-m", "shelf", "sweep", "--if-due"]
 
@@ -245,16 +241,17 @@ id = "picker"
 title = "Shelf"
 placement = "popup"
 width = "80%"
-height = 20
+height = "80%"
 command = ["python3", "-m", "shelf", "pick"]
 ```
 
-Sweeps are driven by the startup hook and focus events because herdr plugins have
-no timer. A sweep only runs when herdr is in use, which is when tab clutter
-matters. The focus event is tab-level (`tab.focused`) rather than pane-level
-(`pane.focused`): sweeping needs to know when the focused tab changes, and
-tab-level firing means fewer process spawns than pane-level would (a pane
-focus change inside the same tab does not need a sweep).
+Sweeps are driven by the startup hook and the `workspace.focused` event
+because herdr plugins have no timer. A sweep only runs when herdr is in use,
+which is when tab clutter matters. Only one focus event is subscribed to:
+herdr's `emit_focus_api_events` (`src/app/api.rs`) fires `workspace.focused`,
+`tab.focused` and `pane.focused` together for every focus change, so
+subscribing to more than one of them would only spawn the sweep hook process
+multiple times per focus change without adding any coverage.
 
 ## Configuration
 
