@@ -339,8 +339,11 @@ written to a temporary file and renamed into place.
 
 ### Sweep (`sweep --if-due`)
 
-1. Exit if `sweep.lock` is held, or if `last_sweep` is newer than
-   `sweep_interval_minutes`. `sweep` without `--if-due` skips the interval check.
+1. Exit if `last_sweep` is newer than `sweep_interval_minutes`. `sweep` without
+   `--if-due` skips this check. Take `sweep.lock`, exiting if another sweep
+   already holds it, then repeat the interval check once more now that the
+   lock is held, in case another sweep ran (and updated `last_sweep`) in the
+   gap between the first check and acquiring the lock.
 2. List tabs and panes. For each pane read `agent_session` and agent status;
    record `first_seen` for new sessions and "active now" for panes that are
    `working`; compute effective activity.
@@ -350,33 +353,75 @@ written to a temporary file and renamed into place.
 5. In `live`, archive each eligible tab, then show one summary notification.
    herdr compacts ids when a tab closes, so before archiving each tab the sweep
    lists tabs again, finds the tab by its panes' `terminal_id`s, and re-checks
-   eligibility on that fresh data.
-6. Write `last_sweep`, release the lock.
+   eligibility on that fresh data. A single tab's failure (herdr error,
+   filesystem error, or anything unexpected) is logged with its traceback and
+   reported as failed; it never aborts the rest of the sweep.
+6. Write `last_sweep` and show the summary notification in a `finally`, so
+   both happen even if something above raised partway through, then release
+   the lock.
 
 ### Archive one tab
 
-1. `layout.export` for the tab.
-2. For each agent pane, `pane.process_info`, and take the argv of the first
-   foreground process whose `name`, or the basename of whose `argv[0]`, equals
-   the agent table's `program`. If none matches (some installs run the agent
-   under a wrapper), the pane is archived without a launch argv and restores the
-   way `"relaunch": "plain"` does.
-3. Record the tab label, the workspace label, and the first pane's cwd as the
+1. `layout.export` for the tab, then check that the tab's own pane ids match
+   the layout's pane ids exactly. herdr 0.9.0 tab/pane ids are positional, so
+   a close elsewhere between gathering the tab's panes and this step can mean
+   the tab id we hold now points at a different tab; a mismatch skips the tab
+   rather than archiving the wrong one.
+2. For each agent pane, `pane.process_info`, and among the foreground
+   processes whose `name`, or the basename of whose `argv[0]`, equals the
+   agent table's `program`, take the one whose remaining arguments (`argv[1:]`,
+   as a set) are a subset of every other match's remaining arguments -- a
+   wrapper's argv is the user's flags plus whatever it injected, so the
+   user-typed, outermost process is the smallest. When several matches
+   qualify, the first in herdr's own process order wins. When none qualifies
+   (for example an unrelated `claude mcp serve` child also matches the
+   program name, but is not a wrapper around the interactive process), or no
+   process matches at all (some installs run the agent under a wrapper), the
+   pane is archived without a launch argv and restores the way
+   `"relaunch": "plain"` does.
+3. Record the tab label (treating a purely numeric label, herdr's default,
+   as no custom label), the workspace label, and the first pane's cwd as the
    workspace cwd (herdr's workspace info has no cwd).
 4. For Claude panes with `keep_transcripts`, copy the session file and its
    companion directory.
-5. Write the record.
-6. `tab.close`. On `confirmation_required`, delete the record and log a skip.
+5. Write the record. If copying a session file or writing the record fails
+   partway through, the partially written archive folder is removed rather
+   than left behind as a corrupt entry.
+6. Verify the tab's panes are unchanged right before `tab.close`: `pane.list`
+   again and compare the tab's current `terminal_id`s against the ones
+   gathered in step 1. A mismatch (another tab closed in between and shifted
+   the ids) deletes the record and skips the tab instead of closing the wrong
+   one.
+7. `tab.close`. On `confirmation_required`, delete the record and log a skip.
+   On any other definite refusal, delete the record and re-raise. When the
+   outcome is unknown (the reply was lost), `pane.list` once more: if a tab
+   with exactly the original `terminal_id`s still exists, the close never
+   took effect and the record is deleted; otherwise the close did happen and
+   the record -- possibly the only surviving copy -- is kept. Either way the
+   error is re-raised.
 
 The record is written before the tab is closed, so a failed close loses nothing.
 
+Archive ids are `YYYYMMDDTHHMMSSZ-<6 hex chars>`. Every lookup by id (load,
+delete, and the folder used to copy session files in and out) validates the
+id against that pattern first, so a corrupted or handcrafted id can never
+resolve to a path outside the archive directory.
+
 ### Restore one archived tab
+
+Runs under `sweep.lock` (waiting up to 30 seconds for it), so a restore never
+races a sweep, or a second restore of the same entry, over the same archive
+directory. The record is (re-)loaded once the lock is held; if it is gone by
+then (for example another process already restored it), the lookup raises
+rather than restoring a stale copy.
 
 1. Find the workspace whose label matches the record, taking the first match in
    sidebar order. If none exists, create it with `workspace.create` using the
    saved label and cwd.
 2. If a Claude session file is missing and the archive holds a copy, copy it back
-   to its original path.
+   to its original path. A pane whose saved cwd no longer exists on disk adds a
+   warning ("... no longer exists; the pane opens in herdr's fallback
+   directory") rather than failing the restore.
 3. Build the `layout.apply` tree from the saved layout. Each agent pane's
    `command` becomes
    `["sh", "-c", "trap : INT; <relaunch argv>; exec \"${SHELL:-sh}\""]`, with every
@@ -386,8 +431,18 @@ The record is written before the tab is closed, so a failed close loses nothing.
    shell itself, so a Ctrl-C aimed at the agent does not kill the pane before the
    fallback shell can start. The shell wrapper leaves a usable shell when the agent
    exits. Shell panes get no command and start a shell in their cwd.
-4. Apply with the saved tab label and `focus: true`.
-5. Set `restored_at` for each restored session and delete the archive entry.
+4. Apply with the saved tab label and `focus: true`. `layout.apply` rejects a
+   request that carries both `tab_id` and `workspace_id`, so when step 1 created
+   a new workspace, only its first tab's `tab_id` is sent (never `workspace_id`
+   too); when an existing workspace was found, only `workspace_id` is sent. If
+   apply fails after a workspace was just created for this restore, the new
+   workspace is closed (best effort; a failure to close it is logged, not
+   raised) before the original error is re-raised, so a failed restore does not
+   leave a stray empty workspace behind.
+5. Set `restored_at` for each restored session, then delete the archive entry.
+   A failure while recording `restored_at` is logged but never keeps the
+   entry: once `layout.apply` has succeeded, the tab is live and the archive
+   entry must not linger just because bookkeeping afterward had a problem.
 
 If a Claude session file is gone and no copy exists, the agent starts with its
 relaunch argv anyway, and a notification says the conversation may not resume.
@@ -411,7 +466,10 @@ entry. Used for the release check and for archiving a tab by hand.
 - Hooks always exit 0. If the herdr socket is unavailable they do nothing.
 - An error on one tab is logged and the sweep continues with the next tab.
 - Errors go to `shelf.log` and to stderr, which herdr keeps in `herdr plugin log`.
-- A failed restore keeps the archive entry and shows a notification with the error.
+- A restore that fails to apply the layout keeps the archive entry and shows a
+  notification with the error. Once `layout.apply` has succeeded, though, the
+  tab is live and the entry is always deleted, even if recording `restored_at`
+  afterward fails; that failure is only logged.
 - Locks use `fcntl.flock`, so a lock held by a process that dies is released by
   the kernel; lock files are never deleted.
 

@@ -33,6 +33,7 @@ def fake_herdr(test, argv=("/usr/bin/claude", "--model", "opus")):
         "pane.process_info": lambda p: {"process_info": {"foreground_processes": [
             {"pid": 1, "name": "bash", "argv": ["bash"]},
             {"pid": 2, "name": "claude", "argv": list(argv)}]}},
+        "pane.list": lambda p: {"panes": [dict(x) for x in PANES]},
         "tab.close": lambda p: {"type": "ok"},
     })
     return fake
@@ -69,6 +70,8 @@ class CaptureTest(unittest.TestCase):
         self.assertTrue(record["id"].startswith("20260924T120000Z-"))
 
     def test_outermost_matching_process_wins(self):
+        # pid5's argv[1:] is a superset of pid9's -- pid9 (the smaller tail)
+        # is the outermost, user-typed command under the subset rule.
         fake = fake_herdr(self)
         fake.handlers["pane.process_info"] = lambda p: {"process_info": {"foreground_processes": [
             {"pid": 5, "name": "claude", "argv": ["/opt/claude/2.1/claude", "--settings", "{\"a\": 1}", "--model", "opus"]},
@@ -83,6 +86,31 @@ class CaptureTest(unittest.TestCase):
         record, _ = archive.capture(Client(fake.path), TAB, PANES, self.table, self.activity_of, False, T0)
         self.assertIsNone(record["panes"]["w1:p3"]["launch_argv"])
         self.assertEqual(record["session_copies"], [])
+
+    def test_no_outermost_process_when_matches_are_unrelated(self):
+        # Neither candidate's tail is a subset of the other's: an unrelated
+        # "claude mcp serve" child also matches the program name, but it is
+        # not a wrapper around the interactive claude process.
+        fake = fake_herdr(self)
+        fake.handlers["pane.process_info"] = lambda p: {"process_info": {"foreground_processes": [
+            {"pid": 3, "name": "claude", "argv": ["claude", "--model", "opus"]},
+            {"pid": 4, "name": "claude", "argv": ["claude", "mcp", "serve"]}]}}
+        record, _ = archive.capture(Client(fake.path), TAB, PANES, self.table, self.activity_of, False, T0)
+        self.assertIsNone(record["panes"]["w1:p3"]["launch_argv"])
+
+    def test_numeric_tab_label_becomes_none(self):
+        fake = fake_herdr(self)
+        tab = dict(TAB, label="7")
+        record, _ = archive.capture(Client(fake.path), tab, PANES, self.table, self.activity_of, False, T0)
+        self.assertIsNone(record["tab"]["label"])
+
+    def test_layout_pane_ids_mismatch_raises_skip(self):
+        fake = fake_herdr(self)
+        fake.handlers["layout.export"] = lambda p: {"layout": {
+            "workspace_id": "w1", "tab_id": "w1:t2", "zoomed": False, "focused_pane_id": "w1:p3",
+            "root": {"type": "pane", "pane_id": "w1:p999", "cwd": "/src/api"}}}
+        with self.assertRaises(archive.Skip):
+            archive.capture(Client(fake.path), TAB, PANES, self.table, self.activity_of, True, T0)
 
 
 class ArchiveTabTest(unittest.TestCase):
@@ -121,7 +149,30 @@ class ArchiveTabTest(unittest.TestCase):
             archive.archive_tab(Client(fake.path), self.arch, TAB, PANES, self.table, self.activity_of, True, T0)
         self.assertEqual(self.arch.list(), [])
 
-    def test_unknown_close_outcome_keeps_the_record(self):
+    def test_lost_reply_but_tab_confirmed_gone_keeps_the_record(self):
+        # tab.close's reply never arrived, but the close actually happened
+        # server-side: pane.list shows the tab's terminals are gone, so the
+        # record -- the only surviving copy -- must be kept.
+        fake = fake_herdr(self)
+        real = Client(fake.path)
+        state = {"closed": False}
+        fake.handlers["pane.list"] = lambda p: {"panes": [] if state["closed"] else [dict(x) for x in PANES]}
+
+        class LostReply:
+            def call(self, method, params=None):
+                if method == "tab.close":
+                    state["closed"] = True
+                    raise HerdrError("io", "reply lost", definite=False)
+                return real.call(method, params)
+
+        with self.assertRaises(HerdrError):
+            archive.archive_tab(LostReply(), self.arch, TAB, PANES, self.table, self.activity_of, True, T0)
+        self.assertEqual(len(self.arch.list()), 1)
+
+    def test_lost_reply_but_tab_confirmed_still_open_deletes_the_record(self):
+        # tab.close's reply never arrived, and pane.list shows the tab is
+        # still there with exactly its original terminals: the close never
+        # took effect, so the record is a useless duplicate and is removed.
         fake = fake_herdr(self)
         real = Client(fake.path)
 
@@ -133,20 +184,39 @@ class ArchiveTabTest(unittest.TestCase):
 
         with self.assertRaises(HerdrError):
             archive.archive_tab(LostReply(), self.arch, TAB, PANES, self.table, self.activity_of, True, T0)
-        self.assertEqual(len(self.arch.list()), 1)
+        self.assertEqual(self.arch.list(), [])
+
+    def test_pane_list_mismatch_before_close_skips_and_deletes_record(self):
+        fake = fake_herdr(self)
+        fake.handlers["pane.list"] = lambda p: {"panes": [
+            {"pane_id": "w1:p3", "tab_id": "w1:t2", "terminal_id": "term_other", "cwd": "/src/api"}]}
+        with self.assertRaises(archive.Skip):
+            archive.archive_tab(Client(fake.path), self.arch, TAB, PANES, self.table, self.activity_of, True, T0)
+        self.assertEqual(self.arch.list(), [])
+        self.assertNotIn("tab.close", fake.methods())
+
+    def test_layout_mismatch_is_skipped_before_saving_anything(self):
+        fake = fake_herdr(self)
+        fake.handlers["layout.export"] = lambda p: {"layout": {
+            "workspace_id": "w1", "tab_id": "w1:t2", "zoomed": False, "focused_pane_id": "w1:p3",
+            "root": {"type": "pane", "pane_id": "w1:p999", "cwd": "/src/api"}}}
+        with self.assertRaises(archive.Skip):
+            archive.archive_tab(Client(fake.path), self.arch, TAB, PANES, self.table, self.activity_of, True, T0)
+        self.assertEqual(self.arch.list(), [])
 
 
 class StoreTest(unittest.TestCase):
     def test_list_newest_first_and_delete(self):
         with tempfile.TemporaryDirectory() as d:
             arch = archive.Archive(d)
-            arch.save({"id": "a", "archived_at": "2026-09-01T00:00:00Z"}, [])
-            arch.save({"id": "b", "archived_at": "2026-09-02T00:00:00Z"}, [])
-            self.assertEqual([r["id"] for r in arch.list()], ["b", "a"])
-            arch.delete("b")
-            self.assertEqual([r["id"] for r in arch.list()], ["a"])
+            arch.save({"id": "20260901T000000Z-aaaaaa", "archived_at": "2026-09-01T00:00:00Z"}, [])
+            arch.save({"id": "20260902T000000Z-bbbbbb", "archived_at": "2026-09-02T00:00:00Z"}, [])
+            self.assertEqual([r["id"] for r in arch.list()],
+                              ["20260902T000000Z-bbbbbb", "20260901T000000Z-aaaaaa"])
+            arch.delete("20260902T000000Z-bbbbbb")
+            self.assertEqual([r["id"] for r in arch.list()], ["20260901T000000Z-aaaaaa"])
             with self.assertRaises(KeyError):
-                arch.load("b")
+                arch.load("20260902T000000Z-bbbbbb")
 
     def test_put_back_sessions_only_when_missing(self):
         with tempfile.TemporaryDirectory() as d:
@@ -159,7 +229,7 @@ class StoreTest(unittest.TestCase):
             (companion / "f.txt").write_text("f")
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude)}):
                 arch = archive.Archive(Path(d) / "state")
-                rec = {"id": "r1", "archived_at": "2026-09-01T00:00:00Z",
+                rec = {"id": "20260901T000000Z-cccccc", "archived_at": "2026-09-01T00:00:00Z",
                        "session_copies": ["projects/-x/S.jsonl", "projects/-x/S"]}
                 arch.save(rec, [(src, "projects/-x/S.jsonl"), (companion, "projects/-x/S")])
                 self.assertEqual(arch.put_back_sessions(rec), [])
@@ -168,6 +238,39 @@ class StoreTest(unittest.TestCase):
                 self.assertEqual(arch.put_back_sessions(rec), ["projects/-x/S.jsonl", "projects/-x/S"])
                 self.assertEqual(src.read_text(), "original\n")
                 self.assertEqual((companion / "f.txt").read_text(), "f")
+
+    def test_delete_of_an_invalid_id_raises_and_touches_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            arch = archive.Archive(d)
+            arch.save({"id": "20260901T000000Z-aaaaaa", "archived_at": "2026-09-01T00:00:00Z"}, [])
+            with self.assertRaises(KeyError):
+                arch.delete("..")
+            self.assertEqual([r["id"] for r in arch.list()], ["20260901T000000Z-aaaaaa"])
+            self.assertTrue((Path(d) / "archive" / "20260901T000000Z-aaaaaa").exists())
+
+    def test_put_back_sessions_ignores_path_traversal(self):
+        with tempfile.TemporaryDirectory() as d:
+            claude = Path(d) / "claude"
+            claude.mkdir()
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude)}):
+                arch = archive.Archive(Path(d) / "state")
+                rec = {"id": "20260901T000000Z-dddddd", "archived_at": "2026-09-01T00:00:00Z",
+                       "session_copies": ["../escaped", "/abs/escaped"]}
+                arch.save(rec, [])
+                self.assertEqual(arch.put_back_sessions(rec), [])
+                self.assertFalse((Path(d) / "escaped").exists())
+                self.assertFalse(Path("/abs/escaped").exists())
+
+    def test_save_removes_partial_folder_on_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            arch = archive.Archive(d)
+            rec = {"id": "20260901T000000Z-eeeeee", "archived_at": "2026-09-01T00:00:00Z"}
+            src = Path(d) / "src.jsonl"
+            src.write_text("data")
+            with mock.patch("shutil.copy2", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    arch.save(rec, [(src, "projects/-x/S.jsonl")])
+            self.assertFalse((Path(d) / "archive" / rec["id"]).exists())
 
 
 if __name__ == "__main__":

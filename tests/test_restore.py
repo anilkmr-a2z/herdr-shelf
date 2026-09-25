@@ -12,7 +12,7 @@ from tests.fakeherdr import FakeError, FakeHerdr
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
 RECORD = {
-    "version": 1, "id": "r1", "archived_at": "2026-09-20T00:00:00Z",
+    "version": 1, "id": "20260920T000000Z-aaaaaa", "archived_at": "2026-09-20T00:00:00Z",
     "workspace": {"label": "api-service", "cwd": "/src/api"},
     "tab": {"label": "fix-retries"},
     "layout": {"focused_pane_id": "w1:p3", "zoomed": False, "root": {
@@ -52,19 +52,39 @@ class RestoreTest(unittest.TestCase):
         session = self.claude / "projects" / "-src-api" / "S1.jsonl"
         session.parent.mkdir(parents=True)
         session.write_text("{}\n")
+        # RECORD's pane cwds ("/src/api", "/src/api/logs") are synthetic and
+        # cannot exist for real on the test machine; the missing-cwd warning
+        # needs an existing directory as its "happy path" baseline, so pane
+        # metadata (not the layout tree, which the warning check ignores) is
+        # repointed at a real directory that this test controls.
+        self.existing_cwd = str(Path(self.tmp.name) / "work")
+        os.mkdir(self.existing_cwd)
         self.state = Path(self.tmp.name) / "state"
         self.arch = archive.Archive(self.state)
-        self.arch.save(copy.deepcopy(RECORD), [])
+        self.arch.save(self._record_with_existing_pane_cwds(), [])
         self.store = activity.ActivityStore(self.state)
         self.fake = FakeHerdr()
         self.addCleanup(self.fake.close)
-        self.fake.handlers["layout.apply"] = lambda p: {"type": "layout_apply", "layout": {
-            "tab_id": "w1:t7", "workspace_id": p.get("workspace_id")}}
+
+        def layout_apply(p):
+            if "tab_id" in p and "workspace_id" in p:
+                raise FakeError("invalid_target", "use either tab_id or workspace_id, not both")
+            return {"type": "layout_apply", "layout": {"tab_id": "w1:t7", "workspace_id": p.get("workspace_id")}}
+
+        self.fake.handlers["layout.apply"] = layout_apply
         self.fake.handlers["workspace.list"] = lambda p: {"workspaces": [
             {"workspace_id": "w0", "label": "other"}, {"workspace_id": "w1", "label": "api-service"}]}
 
+    def _record_with_existing_pane_cwds(self, **overrides):
+        record = copy.deepcopy(RECORD)
+        for meta in record["panes"].values():
+            if meta.get("cwd"):
+                meta["cwd"] = self.existing_cwd
+        record.update(overrides)
+        return record
+
     def run_restore(self):
-        return restore.restore(Client(self.fake.path), self.arch, self.store, "r1", agents.table(), T0)
+        return restore.restore(Client(self.fake.path), self.arch, self.store, "20260920T000000Z-aaaaaa", agents.table(), T0)
 
     def test_into_existing_workspace(self):
         result = self.run_restore()
@@ -84,13 +104,52 @@ class RestoreTest(unittest.TestCase):
         create = [p for m, p in self.fake.calls if m == "workspace.create"][0]
         self.assertEqual(create, {"label": "api-service", "cwd": "/src/api", "focus": True})
         apply = [p for m, p in self.fake.calls if m == "layout.apply"][0]
-        self.assertEqual((apply["workspace_id"], apply["tab_id"]), ("w9", "w9:t1"))
+        self.assertNotIn("workspace_id", apply)
+        self.assertEqual(apply["tab_id"], "w9:t1")
+
+    def test_failed_apply_after_create_closes_the_new_workspace_and_keeps_the_entry(self):
+        self.fake.handlers["workspace.list"] = lambda p: {"workspaces": []}
+        self.fake.handlers["workspace.create"] = lambda p: {"type": "workspace_created",
+                                                            "workspace": {"workspace_id": "w9", "label": p["label"]},
+                                                            "tab": {"tab_id": "w9:t1"}, "root_pane": {"pane_id": "w9:p1"}}
+        closed = []
+        self.fake.handlers["workspace.close"] = lambda p: (closed.append(p["workspace_id"]), {"type": "ok"})[1]
+
+        def fail(p):
+            raise FakeError("invalid_layout", "bad")
+
+        self.fake.handlers["layout.apply"] = fail
+        with self.assertRaises(HerdrError):
+            self.run_restore()
+        self.assertEqual(closed, ["w9"])
+        self.assertEqual(len(self.arch.list()), 1)
 
     def test_warns_when_conversation_is_gone(self):
         (self.claude / "projects" / "-src-api" / "S1.jsonl").unlink()
         result = self.run_restore()
         self.assertEqual(len(result["warnings"]), 1)
         self.assertIn("S1", result["warnings"][0])
+
+    def test_put_back_sessions_avoids_a_false_missing_conversation_warning(self):
+        record = self._record_with_existing_pane_cwds(id="20260901T000000Z-bbbbbb",
+                                                       session_copies=["projects/-src-api/S1.jsonl"])
+        src = self.claude / "projects" / "-src-api" / "S1.jsonl"
+        self.arch.save(record, [(src, "projects/-src-api/S1.jsonl")])
+        src.unlink()
+        self.assertFalse(src.exists())
+        result = restore.restore(Client(self.fake.path), self.arch, self.store, record["id"], agents.table(), T0)
+        self.assertEqual(result["warnings"], [])
+        self.assertTrue(src.exists())
+
+    def test_warns_when_a_pane_cwd_no_longer_exists(self):
+        record = self._record_with_existing_pane_cwds(id="20260901T000000Z-cccccc")
+        missing = str(Path(self.tmp.name) / "gone")
+        record["panes"]["w1:p4"]["cwd"] = missing
+        self.arch.save(record, [])
+        result = restore.restore(Client(self.fake.path), self.arch, self.store, record["id"], agents.table(), T0)
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn(missing, result["warnings"][0])
+        self.assertIn("fallback directory", result["warnings"][0])
 
     def test_failed_apply_keeps_entry(self):
         def fail(p):
@@ -100,6 +159,12 @@ class RestoreTest(unittest.TestCase):
         with self.assertRaises(HerdrError):
             self.run_restore()
         self.assertEqual(len(self.arch.list()), 1)
+
+    def test_bookkeeping_failure_after_a_successful_apply_still_deletes_the_entry(self):
+        with mock.patch("shelf.activity.ActivityStore.update", side_effect=OSError("disk full")):
+            result = self.run_restore()
+        self.assertEqual(result["tab_id"], "w1:t7")
+        self.assertEqual(self.arch.list(), [])
 
 
 if __name__ == "__main__":

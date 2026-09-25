@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import secrets
 import shutil
 from datetime import datetime
@@ -14,9 +16,26 @@ from .util import atomic_write_json, iso, read_json
 
 log = logging.getLogger("shelf")
 
+# YYYYMMDDTHHMMSSZ-<6 hex chars>, matching new_id() below. Archive ids come
+# from disk (folder names) and from callers who read a record.json we wrote
+# ourselves, but a corrupted or handcrafted id must never be used to build a
+# filesystem path outside the archive root (e.g. "..", or an absolute path).
+_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
+
 
 class Skip(Exception):
     """The tab cannot be archived right now. Nothing was changed."""
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 class Archive:
@@ -26,26 +45,37 @@ class Archive:
         self.root = Path(state_dir) / "archive"
 
     def _dir(self, archive_id: str) -> Path:
+        if not isinstance(archive_id, str) or not _ID_RE.match(archive_id):
+            raise KeyError(archive_id)
         return self.root / archive_id
 
     def save(self, record: dict, session_files: list) -> None:
-        """session_files: (source path, path relative to the Claude home) pairs to copy."""
+        """session_files: (source path, path relative to the Claude home) pairs to copy.
+
+        If anything fails partway through, the partially written folder is
+        removed rather than left around as a corrupt archive entry.
+        """
         folder = self._dir(record["id"])
-        for src, rel in session_files:
-            dest = folder / "sessions" / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if Path(src).is_dir():
-                shutil.copytree(src, dest, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dest)
-        atomic_write_json(folder / "record.json", record)
+        try:
+            for src, rel in session_files:
+                dest = folder / "sessions" / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if Path(src).is_dir():
+                    shutil.copytree(src, dest, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dest)
+            atomic_write_json(folder / "record.json", record)
+        except BaseException:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
+        _fsync_dir(self.root)
 
     def list(self) -> list:
         records = []
         if self.root.is_dir():
             for path in self.root.glob("*/record.json"):
                 rec = read_json(path, None)
-                if isinstance(rec, dict) and rec.get("id"):
+                if isinstance(rec, dict) and rec.get("id") == path.parent.name:
                     records.append(rec)
         return sorted(records, key=lambda r: r.get("archived_at", ""), reverse=True)
 
@@ -62,9 +92,12 @@ class Archive:
         """Copy archived Claude session files back where Claude deleted them."""
         restored = []
         base = history.claude_home()
+        folder = self._dir(record["id"])
         for rel in record.get("session_copies", []):
+            if not isinstance(rel, str) or not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
+                continue
             target = base / rel
-            src = self._dir(record["id"]) / "sessions" / rel
+            src = folder / "sessions" / rel
             if target.exists() or not src.exists():
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -83,9 +116,14 @@ def new_id(now: datetime) -> str:
 def _launch_argv(client, pane_id: str, entry: dict):
     """The agent's command line as the user typed it.
 
-    Wrappers often re-exec the agent with extra injected arguments, and herdr
-    orders processes by pid, which can wrap. Among the matching processes the
-    one with the fewest arguments is the outermost, user-typed command.
+    Wrappers often re-exec the agent with extra injected arguments, so a
+    wrapper's argv is a superset of the flags the user actually typed. Among
+    the matching processes, the outermost one is whichever process's
+    argv[1:] (as a set) is a subset of every other match's argv[1:]; when
+    several qualify, the first in herdr's own process order wins. When no
+    candidate qualifies -- for example an unrelated "claude mcp serve" child
+    that also matches the program name, but is not a wrapper around the
+    interactive process -- there is no reliable outermost command.
     """
     info = client.call("pane.process_info", {"pane_id": pane_id}).get("process_info") or {}
     matches = []
@@ -93,7 +131,16 @@ def _launch_argv(client, pane_id: str, entry: dict):
         argv = [a for a in (proc.get("argv") or []) if isinstance(a, str)]
         if argv and (proc.get("name") == entry["program"] or agents.matches_program(entry, argv[0])):
             matches.append(argv)
-    return min(matches, key=len) if matches else None
+    if not matches:
+        log.warning("%s: no %s process found; it will restore with a plain resume", pane_id, entry["program"])
+        return None
+    tails = [set(argv[1:]) for argv in matches]
+    for argv, tail in zip(matches, tails):
+        if all(tail <= other for other in tails):
+            return argv
+    log.warning("%s: %d %s processes found but none looks like the outermost one; "
+                "it will restore with a plain resume", pane_id, len(matches), entry["program"])
+    return None
 
 
 def _workspace_label(client, workspace_id: str):
@@ -103,11 +150,41 @@ def _workspace_label(client, workspace_id: str):
     return None
 
 
+def _pane_ids(node: dict) -> set:
+    if node.get("type") == "split":
+        return _pane_ids(node["first"]) | _pane_ids(node["second"])
+    pid = node.get("pane_id")
+    return {pid} if pid else set()
+
+
+def _pane_terminals(panes: list) -> frozenset:
+    return frozenset(p["terminal_id"] for p in panes if p.get("terminal_id"))
+
+
+def _tab_terminals(client, tab_id: str) -> frozenset:
+    panes = client.call("pane.list").get("panes", [])
+    return frozenset(p["terminal_id"] for p in panes if p.get("tab_id") == tab_id and p.get("terminal_id"))
+
+
+def _tab_with_terminals_exists(client, terminals: frozenset) -> bool:
+    if not terminals:
+        return False
+    by_tab = {}
+    for p in client.call("pane.list").get("panes", []):
+        if p.get("terminal_id"):
+            by_tab.setdefault(p.get("tab_id"), set()).add(p["terminal_id"])
+    return terminals in (frozenset(v) for v in by_tab.values())
+
+
 def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_transcripts: bool, now: datetime):
     """Build the archive record for a tab. Returns (record, session_files)."""
     layout = client.call("layout.export", {"tab_id": tab["tab_id"]}).get("layout")
     if not layout or "root" not in layout:
         raise Skip("layout.export returned no layout")
+    if _pane_ids(layout["root"]) != {p["pane_id"] for p in panes if p.get("pane_id")}:
+        # herdr 0.9.0 tab/pane ids are positional: a close elsewhere between
+        # our gather() and this call can make tab_id now mean a different tab.
+        raise Skip("layout does not match the tab's panes")
     workspace_label = _workspace_label(client, tab["workspace_id"])
     pane_meta, session_files, copies = {}, [], []
     for pane in panes:
@@ -117,9 +194,6 @@ def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_trans
             agent = session["agent"]
             last = activity_of(agent, session["value"])
             launch_argv = _launch_argv(client, pane["pane_id"], table[agent])
-            if launch_argv is None:
-                log.warning("%s: no %s process found; it will restore with a plain resume",
-                            pane["pane_id"], table[agent]["program"])
             meta.update({
                 "agent": agent,
                 "session": {"kind": session.get("kind"), "value": session["value"], "source": session.get("source")},
@@ -133,12 +207,15 @@ def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_trans
                     copies.append(rel)
         pane_meta[pane["pane_id"]] = meta
     first_cwd = next((m["cwd"] for m in pane_meta.values() if m.get("cwd")), None)
+    label = tab.get("label")
+    if isinstance(label, str) and label.isdigit():
+        label = None  # herdr's default label is just the tab number, not a custom name
     record = {
         "version": 1,
         "id": new_id(now),
         "archived_at": iso(now),
         "workspace": {"label": workspace_label, "cwd": first_cwd},
-        "tab": {"label": tab.get("label")},
+        "tab": {"label": label},
         "layout": {"root": layout["root"], "focused_pane_id": layout.get("focused_pane_id"),
                    "zoomed": bool(layout.get("zoomed"))},
         "panes": pane_meta,
@@ -149,16 +226,31 @@ def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_trans
 
 def archive_tab(client, arch: Archive, tab: dict, panes: list, table: dict, activity_of,
                 keep_transcripts: bool, now: datetime) -> str:
-    """Write the record, then close the tab. Returns the archive id."""
+    """Write the record, verify the tab is unchanged, then close it. Returns the archive id."""
     record, session_files = capture(client, tab, panes, table, activity_of, keep_transcripts, now)
     arch.save(record, session_files)
+    expected_terminals = _pane_terminals(panes)
+    if _tab_terminals(client, tab["tab_id"]) != expected_terminals:
+        # Another tab closing between our gather() and here can shift
+        # herdr's positional ids onto a different tab; closing tab_id now
+        # would close the wrong thing, so back out instead.
+        arch.delete(record["id"])
+        raise Skip("tab changed before it could be closed")
     try:
         client.call("tab.close", {"tab_id": tab["tab_id"]})
     except HerdrError as e:
-        # Only a definite refusal means the tab is still open. If the outcome is
-        # unknown (the reply was lost), keep the record: it may be the only copy.
+        # A definite refusal means the tab is untouched: delete the record.
+        # Otherwise the outcome is unknown (the reply was lost); ask
+        # pane.list whether the tab is still there before deciding, rather
+        # than guessing.
         if e.definite:
             arch.delete(record["id"])
+        else:
+            try:
+                if _tab_with_terminals_exists(client, expected_terminals):
+                    arch.delete(record["id"])
+            except HerdrError:
+                pass  # can't confirm the outcome; keep the record rather than risk losing the only copy
         if e.code == "confirmation_required":
             raise Skip("closing it would close a worktree group") from e
         raise

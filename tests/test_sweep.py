@@ -8,7 +8,7 @@ from unittest import mock
 from shelf import activity, agents, archive, config, sweep
 from shelf.api import Client
 from shelf.util import FileLock
-from tests.fakeherdr import FakeHerdr
+from tests.fakeherdr import FakeError, FakeHerdr
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
 IDLE = timedelta(days=7)
@@ -72,9 +72,7 @@ class RunTest(unittest.TestCase):
             "tab.list": lambda p: {"tabs": [dict(t) for t in self.tabs]},
             "pane.list": lambda p: {"panes": [dict(x) for x in self.panes]},
             "notification.show": lambda p: {"type": "ok"},
-            "layout.export": lambda p: {"layout": {"workspace_id": "w1", "tab_id": p["tab_id"], "zoomed": False,
-                                                   "focused_pane_id": "w1:p1",
-                                                   "root": {"type": "pane", "pane_id": "w1:p1", "cwd": "/src"}}},
+            "layout.export": self.layout_export,
             "workspace.list": lambda p: {"workspaces": [{"workspace_id": "w1", "label": "main"}]},
             "pane.process_info": lambda p: {"process_info": {"foreground_processes": [{"name": "claude", "argv": ["claude"]}]}},
             "tab.close": self.close_tab,
@@ -87,6 +85,11 @@ class RunTest(unittest.TestCase):
         self.tabs = [t for t in self.tabs if t["tab_id"] != p["tab_id"]]
         self.panes = [x for x in self.panes if x["tab_id"] != p["tab_id"]]
         return {"type": "ok"}
+
+    def layout_export(self, p):
+        pane_id = next((x["pane_id"] for x in self.panes if x["tab_id"] == p["tab_id"]), None)
+        return {"layout": {"workspace_id": "w1", "tab_id": p["tab_id"], "zoomed": False,
+                            "focused_pane_id": pane_id, "root": {"type": "pane", "pane_id": pane_id, "cwd": "/src"}}}
 
     def run_sweep(self, **kw):
         kw.setdefault("now", T0)
@@ -162,6 +165,52 @@ class RunTest(unittest.TestCase):
             sweep.archive_now(Client(self.fake.path), self.cfg, self.state, agents.table(), "w1:t2", now=T0)
         with self.assertRaises(archive.Skip):
             sweep.archive_now(Client(self.fake.path), self.cfg, self.state, agents.table(), "w1:t404", now=T0)
+
+    def test_live_skips_a_target_that_becomes_ineligible_before_closing(self):
+        self.cfg["mode"] = "live"
+        original = self.fake.handlers["tab.list"]
+        count = {"n": 0}
+
+        def flips_focused(p):
+            count["n"] += 1
+            if count["n"] == 2:
+                for t in self.tabs:
+                    if t["tab_id"] == "w1:t1":
+                        t["focused"] = True
+            return original(p)
+
+        self.fake.handlers["tab.list"] = flips_focused
+        report = self.run_sweep()
+        self.assertEqual(report["archived"], [])
+        self.assertNotIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+
+    def test_live_isolates_a_failed_target_and_still_archives_the_rest(self):
+        self.cfg["mode"] = "live"
+        self.tabs.append({"tab_id": "w1:t3", "workspace_id": "w1", "label": "also-old", "focused": False})
+        self.panes.append(pane("w1:p3", session="OLD3", tab="w1:t3"))
+        activity.ActivityStore(self.state).update(
+            lambda d: d.update({"claude:OLD3": {"first_seen": "2026-09-01T00:00:00Z"}}))
+        original_close = self.close_tab
+
+        def close_tab(p):
+            if p["tab_id"] == "w1:t1":
+                raise FakeError("definite_fail", "nope")
+            return original_close(p)
+
+        self.fake.handlers["tab.close"] = close_tab
+        report = self.run_sweep()
+        self.assertEqual(sorted(report["eligible"]), ["also-old", "old"])
+        self.assertEqual(report["archived"], ["also-old"])
+        self.assertEqual([label for label, _ in report["failed"]], ["old"])
+        notes = [p for m, p in self.fake.calls if m == "notification.show"]
+        self.assertEqual(notes[-1]["body"], "shelf: archived 1 tab: also-old; 1 failed, see herdr plugin log")
+
+    def test_if_due_is_rechecked_after_acquiring_the_lock(self):
+        self.cfg["mode"] = "live"
+        with mock.patch("shelf.sweep._due", side_effect=[True, False]):
+            result = self.run_sweep(if_due=True)
+        self.assertIsNone(result)
+        self.assertNotIn("tab.close", self.fake.methods())
 
 
 class SummaryTest(unittest.TestCase):

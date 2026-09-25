@@ -133,11 +133,24 @@ def run(client, cfg: dict, state_dir, table: dict, if_due: bool = False, now: da
     except LockBusy:  # another sweep is running; any other LockBusy must surface
         return None
     try:
-        report = _sweep(client, cfg, state, table, now)
-        (state / "last_sweep").write_text(iso(now) + "\n")
+        # Another sweep may have run (and updated last_sweep) between the
+        # check above and actually getting the lock; re-check now to avoid
+        # double-sweeping right after it.
+        if if_due and not _due(state, cfg["sweep_interval_minutes"], now):
+            return None
+        report = None
+        try:
+            report = _sweep(client, cfg, state, table, now)
+            return report
+        finally:
+            # Always notify and record when we swept, even if _sweep raised
+            # partway through, so a systemic failure does not also wedge the
+            # sweep_interval throttle or silently skip notifying.
+            if report is not None:
+                _notify(client, report)
+            (state / "last_sweep").write_text(iso(now) + "\n")
     finally:
         lock.__exit__(None, None, None)
-    return report
 
 
 def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime) -> dict:
@@ -178,13 +191,14 @@ def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime) -> dict:
             except archive.Skip as e:
                 report["skipped"].append((label, str(e)))
                 log.info("skipped %s: %s", label, e)
-            except (HerdrError, OSError) as e:
+            except Exception as e:
+                # A single target's failure (herdr error, filesystem error,
+                # or anything unexpected) must not abort the rest of the sweep.
                 report["failed"].append((label, str(e)))
-                log.error("failed to archive %s: %s", label, e)
+                log.exception("failed to archive %s", label)
             else:
                 report["archived"].append(label)
                 log.info("archived %s as %s", label, archive_id)
-    _notify(client, report)
     return report
 
 
