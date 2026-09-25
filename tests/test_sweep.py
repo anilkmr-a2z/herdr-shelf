@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from shelf import activity, agents, archive, config, sweep
-from shelf.api import Client
+from shelf.api import Client, HerdrError
 from shelf.util import FileLock
 from tests.fakeherdr import FakeError, FakeHerdr
 
@@ -211,6 +211,58 @@ class RunTest(unittest.TestCase):
             result = self.run_sweep(if_due=True)
         self.assertIsNone(result)
         self.assertNotIn("tab.close", self.fake.methods())
+
+    def test_partial_sweep_still_notifies_once_when_a_later_targets_gather_fails(self):
+        self.cfg["mode"] = "live"
+        self.tabs.append({"tab_id": "w1:t3", "workspace_id": "w1", "label": "also-old", "focused": False})
+        self.panes.append(pane("w1:p3", session="OLD3", tab="w1:t3"))
+        activity.ActivityStore(self.state).update(
+            lambda d: d.update({"claude:OLD3": {"first_seen": "2026-09-01T00:00:00Z"}}))
+        original = self.fake.handlers["tab.list"]
+        count = {"n": 0}
+
+        def flaky(p):
+            count["n"] += 1
+            if count["n"] == 3:  # the second target's per-target re-gather
+                raise FakeError("definite_fail", "gone")
+            return original(p)
+
+        self.fake.handlers["tab.list"] = flaky
+        report = self.run_sweep()
+        self.assertEqual(report["archived"], ["old"])
+        self.assertEqual([label for label, _ in report["failed"]], ["also-old"])
+        notes = [p for m, p in self.fake.calls if m == "notification.show"]
+        self.assertEqual(len(notes), 1)
+
+    def test_a_single_targets_unexpected_exception_does_not_abort_the_sweep(self):
+        self.cfg["mode"] = "live"
+        self.tabs.append({"tab_id": "w1:t3", "workspace_id": "w1", "label": "also-old", "focused": False})
+        self.panes.append(pane("w1:p3", session="OLD3", tab="w1:t3"))
+        activity.ActivityStore(self.state).update(
+            lambda d: d.update({"claude:OLD3": {"first_seen": "2026-09-01T00:00:00Z"}}))
+        with mock.patch("shelf.archive.archive_tab", side_effect=[ValueError("boom"), "dummy-id"]):
+            report = self.run_sweep()
+        self.assertEqual([label for label, _ in report["failed"]], ["old"])
+        self.assertEqual(report["archived"], ["also-old"])
+
+    def test_last_sweep_written_after_a_successful_gather(self):
+        self.run_sweep()
+        self.assertTrue((self.state / "last_sweep").exists())
+
+    def test_last_sweep_not_written_when_the_initial_gather_fails(self):
+        def fail(p):
+            raise FakeError("unavailable", "no herdr")
+
+        self.fake.handlers["tab.list"] = fail
+        with self.assertRaises(HerdrError):
+            self.run_sweep()
+        self.assertFalse((self.state / "last_sweep").exists())
+
+    def test_last_sweep_written_even_if_sweep_raises_after_a_successful_gather(self):
+        with mock.patch("shelf.sweep._record_presence", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.run_sweep()
+        self.assertTrue((self.state / "last_sweep").exists())
 
 
 class SummaryTest(unittest.TestCase):

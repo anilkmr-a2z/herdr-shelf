@@ -257,6 +257,14 @@ class StoreTest(unittest.TestCase):
                 rec = {"id": "20260901T000000Z-dddddd", "archived_at": "2026-09-01T00:00:00Z",
                        "session_copies": ["../escaped", "/abs/escaped"]}
                 arch.save(rec, [])
+                # A real file sitting exactly where "../escaped" would
+                # actually read from, so the test fails (something gets
+                # copied out) if the traversal guard is ever removed. The
+                # "sessions" directory must exist too: the OS needs to
+                # traverse through it before it can apply "..".
+                folder = Path(d) / "state" / "archive" / rec["id"]
+                (folder / "sessions").mkdir(parents=True, exist_ok=True)
+                (folder / "escaped").write_text("leaked")
                 self.assertEqual(arch.put_back_sessions(rec), [])
                 self.assertFalse((Path(d) / "escaped").exists())
                 self.assertFalse(Path("/abs/escaped").exists())
@@ -271,6 +279,26 @@ class StoreTest(unittest.TestCase):
                 with self.assertRaises(OSError):
                     arch.save(rec, [(src, "projects/-x/S.jsonl")])
             self.assertFalse((Path(d) / "archive" / rec["id"]).exists())
+
+    def test_id_with_trailing_newline_is_rejected(self):
+        # re.match's "$" matches just before a trailing newline, so a
+        # match()-based check would incorrectly accept this id and let save()
+        # write a real (oddly-named) entry; fullmatch must reject it outright.
+        with tempfile.TemporaryDirectory() as d:
+            arch = archive.Archive(d)
+            with self.assertRaises(KeyError):
+                arch.save({"id": "20260901T000000Z-aaaaaa\n", "archived_at": "2026-09-01T00:00:00Z"}, [])
+            self.assertEqual(arch.list(), [])
+
+    def test_delete_removes_record_first_so_listing_is_unaffected_by_a_failed_rmtree(self):
+        with tempfile.TemporaryDirectory() as d:
+            arch = archive.Archive(d)
+            arch.save({"id": "20260901T000000Z-ffffff", "archived_at": "2026-09-01T00:00:00Z"}, [])
+            with mock.patch("shutil.rmtree") as rmtree:
+                arch.delete("20260901T000000Z-ffffff")  # must not raise even though rmtree below is a no-op
+            rmtree.assert_called_once()
+            self.assertFalse((Path(d) / "archive" / "20260901T000000Z-ffffff" / "record.json").exists())
+            self.assertEqual(arch.list(), [])
 
 
 if __name__ == "__main__":

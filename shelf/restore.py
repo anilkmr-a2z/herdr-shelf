@@ -13,6 +13,11 @@ from .util import FileLock
 
 log = logging.getLogger("shelf")
 
+# How long restore() waits for sweep.lock before giving up. A module constant
+# (rather than a literal at the call site) so tests can shrink it and avoid a
+# slow test when they intentionally hold the lock.
+RESTORE_LOCK_WAIT_SECONDS = 30.0
+
 
 def build_tree(node: dict, panes_meta: dict, table: dict) -> dict:
     """The layout.apply tree: same splits, agent panes resume, shell panes get a shell."""
@@ -54,19 +59,22 @@ def restore(client, arch, store, archive_id: str, table: dict, now: datetime) ->
     a concurrent restore of the same entry) never race on the archive.
     """
     state = Path(arch.root).parent
-    with FileLock(state / "sweep.lock", wait_seconds=30.0):
+    with FileLock(state / "sweep.lock", wait_seconds=RESTORE_LOCK_WAIT_SECONDS):
         record = arch.load(archive_id)  # KeyError if another process already restored it
         arch.put_back_sessions(record)
         panes = record.get("panes", {})
+        # The tab's own label is usually most specific; fall back to the
+        # workspace label, then a generic word, rather than literally "None".
+        label = record["tab"].get("label") or record.get("workspace", {}).get("label") or "tab"
         warnings = []
         for meta in panes.values():
             if meta.get("agent") == "claude" and not history.claude_session_file(meta["session"]["value"]):
-                warnings.append(f"{record['tab'].get('label')}: Claude conversation {meta['session']['value']} "
+                warnings.append(f"{label}: Claude conversation {meta['session']['value']} "
                                 "was not found, so it may not resume")
         missing_cwds = sorted({meta["cwd"] for meta in panes.values()
                                 if meta.get("cwd") and not os.path.isdir(meta["cwd"])})
         for cwd in missing_cwds:
-            warnings.append(f"{record['tab'].get('label')}: {cwd} no longer exists; "
+            warnings.append(f"{label}: {cwd} no longer exists; "
                             "the pane opens in herdr's fallback directory")
 
         params = {"root": build_tree(record["layout"]["root"], panes, table),

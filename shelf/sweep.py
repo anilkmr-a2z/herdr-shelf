@@ -138,28 +138,33 @@ def run(client, cfg: dict, state_dir, table: dict, if_due: bool = False, now: da
         # double-sweeping right after it.
         if if_due and not _due(state, cfg["sweep_interval_minutes"], now):
             return None
-        report = None
+        report = {"mode": cfg["mode"], "eligible": [], "archived": [], "failed": [], "skipped": []}
+        gathered = []
         try:
-            report = _sweep(client, cfg, state, table, now)
+            _sweep(client, cfg, state, table, now, report, gathered)
             return report
         finally:
-            # Always notify and record when we swept, even if _sweep raised
-            # partway through, so a systemic failure does not also wedge the
-            # sweep_interval throttle or silently skip notifying.
-            if report is not None:
-                _notify(client, report)
-            (state / "last_sweep").write_text(iso(now) + "\n")
+            # Notify with whatever the report holds -- even a partial one --
+            # so a sweep that failed partway through is still surfaced, and
+            # exactly once. last_sweep is only written once the initial
+            # gather succeeded: if herdr could not even be listed, the next
+            # check (e.g. a focus event) should retry rather than wait out
+            # the interval.
+            _notify(client, report)
+            if gathered:
+                (state / "last_sweep").write_text(iso(now) + "\n")
     finally:
         lock.__exit__(None, None, None)
 
 
-def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime) -> dict:
-    store = activity.ActivityStore(state)
+def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime, report: dict, gathered: list) -> None:
+    """Mutate report in place. Appends to gathered once the initial gather succeeds."""
     tabs = gather(client)
+    gathered.append(True)
+    store = activity.ActivityStore(state)
     store.update(lambda d: _record_presence(d, tabs, now))
     activity_of = _activity_lookup(store.load())
     idle = timedelta(days=cfg["idle_days"])
-    report = {"mode": cfg["mode"], "eligible": [], "archived": [], "failed": [], "skipped": []}
     targets = []
     for tab, panes in tabs:
         label = tab.get("label") or tab["tab_id"]
@@ -172,9 +177,14 @@ def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime) -> dict:
     if cfg["mode"] != "live":
         for label in report["eligible"]:
             log.info("dry-run: would archive %s", label)
-    else:
-        arch = archive.Archive(state)
-        for label, terminals in targets:
+        return
+    arch = archive.Archive(state)
+    for label, terminals in targets:
+        try:
+            # Re-gather, re-locate and re-decide inside this target's own try:
+            # herdr compacts ids when a tab closes, so a failure here (or in
+            # archive_tab below) must be reported as this target's failure
+            # and must not abort the rest of the sweep.
             activity_of = _activity_lookup(store.load())  # a track hook may have fired meanwhile
             found = _find(gather(client), terminals)
             if found is None:
@@ -185,21 +195,19 @@ def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime) -> dict:
             if reason:
                 report["skipped"].append((label, reason))
                 continue
-            try:
-                archive_id = archive.archive_tab(client, arch, tab, panes, table, activity_of,
-                                                 cfg["keep_transcripts"], now)
-            except archive.Skip as e:
-                report["skipped"].append((label, str(e)))
-                log.info("skipped %s: %s", label, e)
-            except Exception as e:
-                # A single target's failure (herdr error, filesystem error,
-                # or anything unexpected) must not abort the rest of the sweep.
-                report["failed"].append((label, str(e)))
-                log.exception("failed to archive %s", label)
-            else:
-                report["archived"].append(label)
-                log.info("archived %s as %s", label, archive_id)
-    return report
+            archive_id = archive.archive_tab(client, arch, tab, panes, table, activity_of,
+                                             cfg["keep_transcripts"], now)
+        except archive.Skip as e:
+            report["skipped"].append((label, str(e)))
+            log.info("skipped %s: %s", label, e)
+        except Exception as e:
+            # A single target's failure (herdr error, filesystem error, or
+            # anything unexpected) must not abort the rest of the sweep.
+            report["failed"].append((label, str(e)))
+            log.exception("failed to archive %s", label)
+        else:
+            report["archived"].append(label)
+            log.info("archived %s as %s", label, archive_id)
 
 
 def archive_now(client, cfg: dict, state_dir, table: dict, tab_id: str, now: datetime | None = None) -> str:

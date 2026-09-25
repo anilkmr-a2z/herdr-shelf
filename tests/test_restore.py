@@ -8,6 +8,7 @@ from unittest import mock
 
 from shelf import activity, agents, archive, restore
 from shelf.api import Client, HerdrError
+from shelf.util import FileLock, LockBusy
 from tests.fakeherdr import FakeError, FakeHerdr
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
@@ -165,6 +166,34 @@ class RestoreTest(unittest.TestCase):
             result = self.run_restore()
         self.assertEqual(result["tab_id"], "w1:t7")
         self.assertEqual(self.arch.list(), [])
+
+    def test_restore_gives_up_when_a_sweep_already_holds_the_lock(self):
+        with FileLock(self.state / "sweep.lock"), \
+                mock.patch("shelf.restore.RESTORE_LOCK_WAIT_SECONDS", 0.1):
+            with self.assertRaises(LockBusy):
+                self.run_restore()
+        self.assertNotIn("layout.apply", [m for m, _ in self.fake.calls])
+
+    def test_warnings_fall_back_to_workspace_label_or_tab_when_both_are_none(self):
+        (self.claude / "projects" / "-src-api" / "S1.jsonl").unlink()
+
+        record = self._record_with_existing_pane_cwds(id="20260901T000000Z-ffffff")
+        record["tab"]["label"] = None
+        self.arch.save(record, [])
+        result = restore.restore(Client(self.fake.path), self.arch, self.store, record["id"], agents.table(), T0)
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertTrue(result["warnings"][0].startswith("api-service: "), result["warnings"][0])
+
+        self.fake.handlers["workspace.create"] = lambda p: {"type": "workspace_created",
+                                                             "workspace": {"workspace_id": "w9", "label": p.get("label")},
+                                                             "tab": {"tab_id": "w9:t1"}, "root_pane": {"pane_id": "w9:p1"}}
+        record2 = self._record_with_existing_pane_cwds(id="20260901T000000Z-eeeeee")
+        record2["tab"]["label"] = None
+        record2["workspace"]["label"] = None
+        self.arch.save(record2, [])
+        result2 = restore.restore(Client(self.fake.path), self.arch, self.store, record2["id"], agents.table(), T0)
+        self.assertEqual(len(result2["warnings"]), 1)
+        self.assertTrue(result2["warnings"][0].startswith("tab: "), result2["warnings"][0])
 
 
 if __name__ == "__main__":

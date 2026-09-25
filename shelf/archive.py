@@ -20,7 +20,7 @@ log = logging.getLogger("shelf")
 # from disk (folder names) and from callers who read a record.json we wrote
 # ourselves, but a corrupted or handcrafted id must never be used to build a
 # filesystem path outside the archive root (e.g. "..", or an absolute path).
-_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
+_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 
 
 class Skip(Exception):
@@ -45,7 +45,7 @@ class Archive:
         self.root = Path(state_dir) / "archive"
 
     def _dir(self, archive_id: str) -> Path:
-        if not isinstance(archive_id, str) or not _ID_RE.match(archive_id):
+        if not isinstance(archive_id, str) or not _ID_RE.fullmatch(archive_id):
             raise KeyError(archive_id)
         return self.root / archive_id
 
@@ -86,7 +86,9 @@ class Archive:
         return rec
 
     def delete(self, archive_id: str) -> None:
-        shutil.rmtree(self._dir(archive_id), ignore_errors=True)
+        folder = self._dir(archive_id)
+        (folder / "record.json").unlink()
+        shutil.rmtree(folder, ignore_errors=True)
 
     def put_back_sessions(self, record: dict) -> list:
         """Copy archived Claude session files back where Claude deleted them."""
