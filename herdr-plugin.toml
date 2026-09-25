@@ -1,0 +1,41 @@
+id = "anilkmr.shelf"
+name = "Shelf"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Archive agent tabs that have been inactive for days, and restore them with their conversation resumed."
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["python3", "-m", "shelf", "sweep", "--if-due"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "-m", "shelf", "track"]
+
+[[events]]
+on = "pane.focused"
+command = ["python3", "-m", "shelf", "sweep", "--if-due"]
+
+[[events]]
+on = "workspace.focused"
+command = ["python3", "-m", "shelf", "sweep", "--if-due"]
+
+[[actions]]
+id = "restore"
+title = "Shelf: restore an archived tab"
+contexts = ["global"]
+command = ["python3", "-m", "shelf", "open-picker"]
+
+[[actions]]
+id = "sweep-now"
+title = "Shelf: sweep now"
+contexts = ["global"]
+command = ["python3", "-m", "shelf", "sweep"]
+
+[[panes]]
+id = "picker"
+title = "Shelf"
+placement = "popup"
+width = "80%"
+height = 20
+command = ["python3", "-m", "shelf", "pick"]

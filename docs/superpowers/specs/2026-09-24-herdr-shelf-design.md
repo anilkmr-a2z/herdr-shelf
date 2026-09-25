@@ -72,8 +72,9 @@ reuses pane and tab ids.
   when the new status is `working`, `blocked` or `done`. Those states mean the agent
   ran, asked for input, or finished. `idle` means a finished agent was seen by the
   user and `unknown` means herdr could not classify it; neither counts.
-- Each sweep also records "active now" for any pane currently `working` or
-  `blocked`, as a backstop for missed events.
+- Each sweep also records "active now" for any pane currently `working`, as a
+  backstop for missed events. `blocked` is not refreshed this way; otherwise a
+  tab left waiting for input would never age.
 - A session seen for the first time gets `first_seen = now`. With generic tracking
   alone, no tab is archived until `idle_days` after the plugin first sees it.
 
@@ -174,7 +175,7 @@ escape hatch for agents started with a positional prompt such as
 | `shelf/archive.py` | Create, list, load and delete archive records; copy Claude session files in and out | state directory |
 | `shelf/restore.py` | Rebuild an archived tab and resume its agents | `api`, `agents`, `archive`, `activity` |
 | `shelf/picker.py` | Popup UI listing archived tabs | `archive`, `restore` |
-| `shelf/__main__.py` | Command-line entry: `track`, `sweep [--if-due]`, `open-picker`, `pick`, `list`, `restore <id>` | all of the above |
+| `shelf/__main__.py` | Command-line entry: `track`, `sweep [--if-due]`, `archive <tab-id>`, `open-picker`, `pick`, `list`, `restore <id>` | all of the above |
 
 Supporting a new agent needs one row in the agent table (or a config override).
 A history source for it is optional.
@@ -314,20 +315,26 @@ written to a temporary file and renamed into place.
    `sweep_interval_minutes`. `sweep` without `--if-due` skips the interval check.
 2. List tabs and panes. For each pane read `agent_session` and agent status;
    record `first_seen` for new sessions and "active now" for panes that are
-   `working` or `blocked`; compute effective activity.
+   `working`; compute effective activity.
 3. Select eligible tabs.
 4. In `dry-run`, log each eligible tab and show one notification, for example
    `shelf (dry-run): would archive 3 tabs: fix-retries, docs-pass, perf-probe`.
 5. In `live`, archive each eligible tab, then show one summary notification.
+   herdr compacts ids when a tab closes, so before archiving each tab the sweep
+   lists tabs again, finds the tab by its panes' `terminal_id`s, and re-checks
+   eligibility on that fresh data.
 6. Write `last_sweep`, release the lock.
 
 ### Archive one tab
 
 1. `layout.export` for the tab.
 2. For each agent pane, `pane.process_info`, and take the argv of the first
-   foreground process whose program basename matches the agent table's `program`.
-   If none matches, the tab is skipped.
-3. Record the tab label and the workspace label and cwd.
+   foreground process whose `name`, or the basename of whose `argv[0]`, equals
+   the agent table's `program`. If none matches (some installs run the agent
+   under a wrapper), the pane is archived without a launch argv and restores the
+   way `"relaunch": "plain"` does.
+3. Record the tab label, the workspace label, and the first pane's cwd as the
+   workspace cwd (herdr's workspace info has no cwd).
 4. For Claude panes with `keep_transcripts`, copy the session file and its
    companion directory.
 5. Write the record.
@@ -362,6 +369,12 @@ Opened by the `restore` action through `plugin.pane.open`. It lists archived tab
 newest first: number, tab label, workspace label, agent, and days since last
 activity. Typing a number restores that entry, `d <number>` deletes one, and `q`
 closes the popup. It uses plain `input()` with no curses dependency.
+
+### Manual archive (`archive <tab-id>`)
+
+Archives one tab now, ignoring `idle_days` and `mode`, but still refusing a tab
+that is focused, working, or has an agent pane without a session id or table
+entry. Used for the release check and for archiving a tab by hand.
 
 ## Failure handling
 
