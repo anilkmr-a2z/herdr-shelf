@@ -16,20 +16,25 @@ herdr plugin install anilkmr-a2z/herdr-shelf
 ```
 
 Requires herdr 0.9.0 or newer and `python3` 3.9 or newer on `PATH`. Linux and
-macOS.
+macOS. On macOS, run `python3 --version` once first: the system `python3`
+needs the Xcode Command Line Tools, and herdr plugin install does not check
+that for you.
 
 Add a key for the restore picker to `~/.config/herdr/config.toml`, then run
 `herdr server reload-config`:
 
 ```toml
 [[keys.command]]
-key = "prefix+alt+s"
+key = "prefix+shift+s"
 type = "plugin_action"
 command = "anilkmr.shelf.restore"
 description = "restore an archived tab"
 ```
 
-`prefix+alt+s` is unbound in herdr's default keymap (`prefix+s` is settings).
+`prefix+shift+s` is unbound in herdr's default keymap (`prefix+s` is
+settings). Many macOS terminals turn alt chords into characters instead of
+sending them as key events, so `prefix+alt+...` bindings often do nothing
+there.
 
 ## It starts in dry-run
 
@@ -68,8 +73,11 @@ their tabs qualify no earlier than `idle_days` after install.
 
 ## Restore
 
-Press your picker key. The popup lists archived tabs, newest first. Type a
-number to restore one, `d <number>` to delete one, or `q` to close.
+Press your picker key. The popup lists archived tabs, newest first, as many
+as fit the popup; run `python3 -m shelf list` to see the rest. Type a number
+to restore one, `d <number>` to delete one, `q` to close, or Esc to close.
+Deleting asks for confirmation (`[y/N]`, default no) and is permanent: there
+is no undo.
 
 A restored tab goes back to the workspace with the same name (recreated if it
 is gone) with the same splits, labels and directories. Each agent is started
@@ -94,7 +102,9 @@ use `agents` in `config.json`.
 ## Configuration
 
 `config.json` in the directory printed by
-`herdr plugin config-dir anilkmr.shelf`. Every key is optional.
+`herdr plugin config-dir anilkmr.shelf`. Every key is optional. Changes take
+effect the next time a hook runs (the next status change, focus change, or
+sweep); there is nothing to reload.
 
 ```json
 {
@@ -115,24 +125,64 @@ use `agents` in `config.json`.
 - `agents.<name>.resume`: resume arguments; `{id}` becomes the session id.
 - `agents.<name>.strip` / `strip_bare`: flags (with or without a value) removed
   from the saved command line before the resume arguments are added.
+- `agents.<name>.strip_subcommand`: a subcommand plus its following argument,
+  removed from the saved command line the same way (codex's own `resume <id>`
+  is stripped this way before Shelf's own resume arguments are added).
 - `agents.<name>.relaunch`: `"plain"` runs `<program> <resume args>` instead of
   the saved command line. Use it for an agent you start with a prompt argument,
   such as `claude "fix the build"`, or the prompt would be sent again.
 
 ## Command line
 
-Run from the plugin directory with the plugin's environment, or use the herdr
-actions `anilkmr.shelf.sweep-now` and `anilkmr.shelf.restore`:
+For routine use, prefer the herdr actions `anilkmr.shelf.sweep-now` and
+`anilkmr.shelf.restore` over the raw commands below.
+
+To run a command by hand, find the plugin's directory with
+`herdr plugin list --plugin anilkmr.shelf --json` (the `plugin_root` field)
+and run from there, so `python3 -m shelf` finds the `shelf` package. The CLI
+looks up the same state and config directories the plugin itself uses (the
+same environment variables when herdr sets them, the same defaults
+otherwise), so it sees the same archived tabs and the same `config.json`:
 
 ```
 python3 -m shelf sweep                 run a sweep now
-python3 -m shelf archive <tab-id>      archive one tab now, ignoring idle_days
+python3 -m shelf archive <tab-id>      archive one tab now, ignoring idle_days and mode
 python3 -m shelf list                  list archived tabs with their ids
 python3 -m shelf restore <archive-id>  restore one archived tab
 ```
 
-Logs go to `shelf.log` in the plugin's state directory and to
-`herdr plugin log anilkmr.shelf`.
+Tab ids for `archive` come from `herdr tab list`.
+
+`shelf.log` in the plugin's state directory is the durable log.
+`herdr plugin log list --plugin anilkmr.shelf` also shows recent plugin
+output, but herdr keeps that log in memory and it is short-lived, so
+`shelf.log` is the one to check for anything older than the last few
+commands.
+
+## Where things live
+
+State: `$XDG_STATE_HOME/herdr/plugins/anilkmr.shelf`, or
+`~/.local/state/herdr/plugins/anilkmr.shelf` when `XDG_STATE_HOME` is not
+set. It holds `archive/` (one folder per archived tab), `activity.json`, and
+`shelf.log`.
+
+Config: the directory printed by `herdr plugin config-dir anilkmr.shelf`.
+
+## Uninstall
+
+Restore anything you want to keep first: an uninstall does not bring archived
+tabs back on its own.
+
+```sh
+herdr plugin uninstall anilkmr.shelf
+```
+
+Remove the `[[keys.command]]` block added in Install from
+`~/.config/herdr/config.toml`, then run `herdr server reload-config`.
+
+Uninstalling keeps the state and config directories, including any archived
+Claude conversation copies. Delete them yourself (see Where things live
+above) if you want everything gone.
 
 ## Limits
 

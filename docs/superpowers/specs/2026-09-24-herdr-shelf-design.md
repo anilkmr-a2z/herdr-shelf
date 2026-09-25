@@ -221,7 +221,7 @@ on = "pane.agent_status_changed"
 command = ["python3", "-m", "shelf", "track"]
 
 [[events]]
-on = "pane.focused"
+on = "tab.focused"
 command = ["python3", "-m", "shelf", "sweep", "--if-due"]
 
 [[events]]
@@ -251,7 +251,10 @@ command = ["python3", "-m", "shelf", "pick"]
 
 Sweeps are driven by the startup hook and focus events because herdr plugins have
 no timer. A sweep only runs when herdr is in use, which is when tab clutter
-matters.
+matters. The focus event is tab-level (`tab.focused`) rather than pane-level
+(`pane.focused`): sweeping needs to know when the focused tab changes, and
+tab-level firing means fewer process spawns than pane-level would (a pane
+focus change inside the same tab does not need a sweep).
 
 ## Configuration
 
@@ -516,7 +519,7 @@ resumes with its original launch flags.
 
    ```toml
    [[keys.command]]
-   key = "prefix+alt+s"          # free in the default keymap; prefix+s is settings
+   key = "prefix+shift+s"        # free in the default keymap; prefix+s is settings
    type = "plugin_action"
    command = "anilkmr.shelf.restore"
    description = "restore an archived tab"

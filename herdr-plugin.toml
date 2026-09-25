@@ -13,7 +13,7 @@ on = "pane.agent_status_changed"
 command = ["python3", "-m", "shelf", "track"]
 
 [[events]]
-on = "pane.focused"
+on = "tab.focused"
 command = ["python3", "-m", "shelf", "sweep", "--if-due"]
 
 [[events]]
