@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from shelf import activity
 from shelf.api import Client
@@ -207,6 +208,10 @@ class AgentDetectedTrackTest(unittest.TestCase):
         self.fake = FakeHerdr()
         self.addCleanup(self.fake.close)
         self.fake.handlers["pane.get"] = lambda p: {"pane": {"pane_id": p["pane_id"], "terminal_id": "term1"}}
+        # Retries are exercised by call count, not wall-clock time.
+        delay_patcher = mock.patch("shelf.activity.AGENT_SESSION_RETRY_DELAY_SECONDS", 0)
+        delay_patcher.start()
+        self.addCleanup(delay_patcher.stop)
 
     def event(self, agent="claude", released=False, pane_id="w1:p1", include_agent=True):
         # herdr omits "released" entirely when it is false, and omits "agent"
@@ -270,6 +275,55 @@ class AgentDetectedTrackTest(unittest.TestCase):
         client = Client(self.fake.path)
         self.assertTrue(activity.track(client, self.store, self.event(), None, T0))
         data = self.store.load()
+        self.assertEqual(list(data.keys()), ["terminals"])
+
+    def test_session_appearing_on_the_third_pane_get_gets_agent_started_at(self):
+        # herdr usually only learns Claude's session id from its own startup
+        # hook, shortly after the agent itself is detected; pane.get's first
+        # replies here still carry no matching session.
+        calls = {"n": 0}
+
+        def pane_get(p):
+            calls["n"] += 1
+            pane = {"pane_id": p["pane_id"], "terminal_id": "term1"}
+            if calls["n"] >= 3:
+                pane["agent_session"] = {"agent": "claude", "kind": "id", "value": "S1", "source": "herdr:claude"}
+            return {"pane": pane}
+
+        self.fake.handlers["pane.get"] = pane_get
+        client = Client(self.fake.path)
+        self.assertTrue(activity.track(client, self.store, self.event(), None, T0))
+        self.assertEqual(calls["n"], 3)
+        data = self.store.load()
+        self.assertEqual(data["claude:S1"]["agent_started_at"], "2026-09-24T12:00:00Z")
+        self.assertEqual(data["terminals"]["term1"]["agent_started_at"], "2026-09-24T12:00:00Z")
+
+    def test_session_never_appearing_only_records_the_terminal_after_retrying(self):
+        calls = {"n": 0}
+
+        def pane_get(p):
+            calls["n"] += 1
+            return {"pane": {"pane_id": p["pane_id"], "terminal_id": "term1"}}
+
+        self.fake.handlers["pane.get"] = pane_get
+        client = Client(self.fake.path)
+        self.assertTrue(activity.track(client, self.store, self.event(), None, T0))
+        self.assertEqual(calls["n"], 1 + activity.AGENT_SESSION_RETRY_ATTEMPTS)
+        data = self.store.load()
+        self.assertEqual(list(data.keys()), ["terminals"])
+
+    def test_stale_session_of_a_different_agent_is_never_marked_started(self):
+        # pane.get keeps reporting a codex session throughout, even though
+        # data["agent"] says claude was just (re)detected: the mismatched
+        # session must never get agent_started_at, not even after retries
+        # are exhausted.
+        self.fake.handlers["pane.get"] = lambda p: {"pane": {
+            "pane_id": p["pane_id"], "terminal_id": "term1",
+            "agent_session": {"agent": "codex", "kind": "id", "value": "OTHER", "source": "herdr:codex"}}}
+        client = Client(self.fake.path)
+        self.assertTrue(activity.track(client, self.store, self.event(agent="claude"), None, T0))
+        data = self.store.load()
+        self.assertNotIn("codex:OTHER", data)
         self.assertEqual(list(data.keys()), ["terminals"])
 
 

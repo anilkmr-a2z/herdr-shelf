@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -12,6 +13,15 @@ from .util import FileLock, atomic_write_json, iso, parse_iso, read_json
 # "idle" only means a finished agent was seen; "unknown" means herdr could not tell.
 ACTIVE_STATUSES = frozenset({"working", "blocked", "done"})
 TOUCH_SKIP = timedelta(seconds=60)
+
+# On a pane.agent_detected event, herdr often has not yet learned the pane's
+# agent_session -- for Claude that comes from its own startup hook, which
+# tends to run just after the agent itself is detected -- so pane.get is
+# retried this many times, sleeping this long between attempts, waiting for
+# a session whose agent matches before giving up. Module constants so tests
+# can set the delay to 0.
+AGENT_SESSION_RETRY_ATTEMPTS = 10
+AGENT_SESSION_RETRY_DELAY_SECONDS = 0.5
 
 # Reserved top-level key in activity.json for per-terminal data (currently
 # just agent_started_at). Every other top-level key is a "<agent>:<value>"
@@ -155,23 +165,44 @@ def _mark_session_started(rec: dict, now: datetime) -> bool:
     return True
 
 
+def _matching_session_key(pane: dict, agent: str) -> str | None:
+    """The pane's agent_session key, but only when that session's own agent
+    equals agent -- a stale session left over from a previous, different
+    agent in this pane must never be marked as this agent's activity."""
+    session = pane.get("agent_session")
+    if isinstance(session, dict) and session.get("agent") == agent and session.get("value"):
+        return session_key(session["agent"], session["value"])
+    return None
+
+
 def _track_agent_detected(client, store: ActivityStore, data: dict, pane_id: str, now: datetime) -> bool:
     """Handle one pane.agent_detected event: a truthy agent that was not
     released means an agent is now running in this pane (started or
     restarted, including a conversation resumed by hand). herdr omits
     "released" entirely when it is false, and omits "agent" on a release, so
     a release never looks like a start.
+
+    herdr often has not yet learned the pane's agent_session at the moment
+    this event fires -- for Claude, that comes from its own startup hook,
+    which tends to run just after the agent itself is detected -- so pane.get
+    is retried (see AGENT_SESSION_RETRY_ATTEMPTS/_DELAY_SECONDS) until a
+    session whose agent matches appears, or the retries are exhausted. The
+    terminal itself is always recorded either way.
     """
-    if not data.get("agent") or data.get("released"):
+    agent = data.get("agent")
+    if not agent or data.get("released"):
         return False
     pane = client.call("pane.get", {"pane_id": pane_id}).get("pane") or {}
     terminal_id = pane.get("terminal_id")
     if not terminal_id:
         return False
-    session = pane.get("agent_session")
-    key = None
-    if isinstance(session, dict) and session.get("agent") and session.get("value"):
-        key = session_key(session["agent"], session["value"])
+    key = _matching_session_key(pane, agent)
+    for _ in range(AGENT_SESSION_RETRY_ATTEMPTS):
+        if key is not None:
+            break
+        time.sleep(AGENT_SESSION_RETRY_DELAY_SECONDS)
+        pane = client.call("pane.get", {"pane_id": pane_id}).get("pane") or {}
+        key = _matching_session_key(pane, agent)
 
     def apply(d: dict) -> bool:
         changed = record_terminal_started(d, terminal_id, now)
