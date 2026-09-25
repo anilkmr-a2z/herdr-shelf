@@ -52,11 +52,23 @@ class ClaudeTest(unittest.TestCase):
         self.assertEqual(history.claude_session_paths("nope"), [])
 
     def test_rejects_a_session_id_that_traverses_out_of_the_projects_dir(self):
-        self.assertIsNone(history.claude_session_file("../../outside/secret"))
-        self.assertEqual(history.claude_session_paths("../../outside/secret"), [])
+        # A real target must exist where the un-validated old glob pattern
+        # would have found it, or this test would pass for the wrong reason
+        # (no match regardless of the regex check).
+        (self.home / "projects" / "-p").mkdir(parents=True)
+        write_jsonl(self.home / "secret.jsonl", [{"type": "user", "timestamp": "2026-09-01T10:00:00Z"}])
+        self.assertIsNone(history.claude_session_file("../../secret"))
+        self.assertEqual(history.claude_session_paths("../../secret"), [])
 
     def test_rejects_a_session_id_containing_a_path_separator(self):
         self.assertIsNone(history.claude_session_file("a/b"))
+
+    def test_rejects_a_session_id_with_a_trailing_newline(self):
+        # A plain "match" with a "$"-terminated pattern would accept a trailing
+        # newline, since "$" matches just before a trailing "\n"; fullmatch
+        # (with no trailing "$") must not have that leniency.
+        write_jsonl(self.home / "projects" / "-p" / "S4\n.jsonl", [{"type": "user", "timestamp": "2026-09-01T10:00:00Z"}])
+        self.assertIsNone(history.claude_session_file("S4\n"))
 
     def test_newest_by_mtime_wins_when_several_files_match(self):
         alphabetically_first = self.home / "projects" / "-proj-aaa" / "S3.jsonl"
@@ -90,7 +102,13 @@ class CodexTest(unittest.TestCase):
                          datetime(2026, 8, 1, 5, 7, 50, 770000, tzinfo=timezone.utc))
 
     def test_rejects_a_session_id_that_traverses_out_of_the_sessions_dir(self):
-        self.assertIsNone(history.codex_session_file("../../outside/secret"))
+        # "rollout-*-" is glued directly onto the id with no separator, so a
+        # standalone ".." component only appears once the id itself contains
+        # a "/"; a directory matching "rollout-*-x" plus a real target one
+        # level up is what the old, un-validated glob pattern would have found.
+        (self.home / "sessions" / "rollout-blah-x").mkdir(parents=True)
+        write_jsonl(self.home / "sessions" / "secret.jsonl", [{"type": "response_item", "timestamp": "2026-09-01T10:00:00Z"}])
+        self.assertIsNone(history.codex_session_file("x/../secret"))
 
     def test_rejects_a_session_id_containing_a_path_separator(self):
         self.assertIsNone(history.codex_session_file("a/b"))
@@ -105,6 +123,35 @@ class CodexTest(unittest.TestCase):
         os.utime(alphabetically_second, (now - 1000, now - 1000))
         os.utime(alphabetically_first, (now, now))
         self.assertEqual(history.codex_session_file("C2"), alphabetically_first)
+
+
+class NewestTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+
+    def test_skips_a_match_removed_between_glob_and_stat(self):
+        gone = self.home / "gone.jsonl"
+        present = self.home / "present.jsonl"
+        gone.write_text("{}")
+        present.write_text("{}")
+        real_stat = Path.stat
+
+        def flaky_stat(self, *args, **kwargs):
+            if self.name == "gone.jsonl":
+                raise FileNotFoundError(self)
+            return real_stat(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", flaky_stat):
+            self.assertEqual(history._newest([str(gone), str(present)]), present)
+
+    def test_returns_none_when_every_match_fails_stat(self):
+        with mock.patch.object(Path, "stat", side_effect=FileNotFoundError):
+            self.assertIsNone(history._newest([str(self.home / "a.jsonl"), str(self.home / "b.jsonl")]))
+
+    def test_empty_input_returns_none(self):
+        self.assertIsNone(history._newest([]))
 
 
 class NoReaderTest(unittest.TestCase):

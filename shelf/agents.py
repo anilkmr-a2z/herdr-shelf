@@ -25,7 +25,12 @@ BUILTIN = {
         "strip": ["-r", "--session-id"],
         "strip_bare": ["--continue", "-c", "--fork-session"],
     },
-    "codex": {"program": "codex", "resume": ["resume", "{id}"], "strip_subcommand": "resume"},
+    "codex": {
+        "program": "codex",
+        "resume": ["resume", "{id}"],
+        "strip_subcommand": "resume",
+        "strip_bare": ["--last", "--all"],
+    },
     "copilot": {"program": "copilot", "resume": ["--resume={id}"]},
     "devin": {"program": "devin", "resume": ["--resume", "{id}"]},
     "droid": {"program": "droid", "resume": ["--resume", "{id}"]},
@@ -99,17 +104,28 @@ def strip_resume(argv: list[str], entry: dict) -> list[str]:
     return out
 
 
+# Agents whose session values can be filesystem paths need more room than the
+# default cap.
+_LONG_VALUE_AGENTS = frozenset({"pi", "omp"})
+_DEFAULT_MAX_VALUE_LENGTH = 512
+_PATH_MAX_VALUE_LENGTH = 4096
+
+
 def valid_session_value(agent: str, value: object) -> bool:
     """Whether value is safe to substitute into a relaunch command.
 
-    Must be a non-empty string of at most 512 characters, with no control
-    characters, and not starting with "-" (which could be read as a flag).
-    letta's "default:<agent-id>" form additionally needs a non-empty
-    <agent-id>.
+    Must be a non-empty string, with no C0 or C1 control characters, and not
+    starting with "-" (which could be read as a flag). Capped at 512
+    characters, except for agents whose session values can be filesystem
+    paths (pi, omp), which allow up to 4096. letta's "default:<agent-id>"
+    form additionally needs a non-empty <agent-id>.
     """
-    if not isinstance(value, str) or not value or len(value) > 512:
+    if not isinstance(value, str) or not value:
         return False
-    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+    max_length = _PATH_MAX_VALUE_LENGTH if agent in _LONG_VALUE_AGENTS else _DEFAULT_MAX_VALUE_LENGTH
+    if len(value) > max_length:
+        return False
+    if any(ord(c) < 32 or 127 <= ord(c) <= 0x9F for c in value):
         return False
     if value.startswith("-"):
         return False

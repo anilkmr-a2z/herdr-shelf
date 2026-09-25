@@ -136,7 +136,7 @@ resume arguments are appended. It mirrors herdr's `src/agent_resume.rs`.
 | herdr agent | Program | Resume args | Also stripped |
 |---|---|---|---|
 | `claude` | `claude` | `--resume {id}` | `-r <x>`, `--continue`, `-c`, `--session-id <x>`, `--fork-session` |
-| `codex` | `codex` | `resume {id}` | a `resume <x>` subcommand |
+| `codex` | `codex` | `resume {id}` | a `resume <x>` subcommand, `--last`, `--all` |
 | `copilot` | `copilot` | `--resume={id}` | |
 | `devin` | `devin` | `--resume {id}` | |
 | `droid` | `droid` | `--resume {id}` | |
@@ -177,9 +177,14 @@ A few rules make stripping and relaunching safe against surprising saved argvs:
   path that may have since been deleted); it is left alone otherwise, for
   example when the saved command is a wrapper like `node`.
 - If the stripped argv still contains a token with whitespace or a `--` token,
-  the plain relaunch is used instead, so a prompt is never sent twice.
-- Session values must be non-empty, at most 512 characters, contain no control
-  characters, and not start with `-`.
+  the plain relaunch is used instead, so a prompt is never sent twice. A
+  one-word positional prompt such as `claude hello` cannot be detected this
+  way (no whitespace, no `--`) and is sent again; `"relaunch": "plain"` is the
+  fix for that case.
+- Session values must be non-empty, contain no C0 or C1 control characters,
+  and not start with `-`. Capped at 512 characters, except for agents whose
+  session values can be filesystem paths (`pi`, `omp`), which allow up to
+  4096.
 
 ## Components
 
@@ -327,7 +332,10 @@ written to a temporary file and renamed into place.
 4. Record "active now" for `<agent>:<session value>`, subject to the 60-second
    skip. `working` always counts; `blocked` and `done` count only on a change
    of status from the last status recorded for that session, because herdr
-   also fires this event when only a pane's title or labels change.
+   also fires this event when only a pane's title or labels change. This means
+   that if a `working` event is lost (for example the plugin was not running),
+   a following `done` with the same status as the one already on record is
+   not counted either.
 
 ### Sweep (`sweep --if-due`)
 

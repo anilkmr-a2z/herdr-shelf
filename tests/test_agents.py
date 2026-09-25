@@ -75,6 +75,16 @@ class RelaunchTest(unittest.TestCase):
         self.assertEqual(agents.relaunch_argv("codex", self.t["codex"], "NEW", saved),
                          ["codex", "--model", "o4", "resume", "NEW"])
 
+    def test_codex_strips_last_and_all_bare_flags(self):
+        # Regression: "resume" has no following value here, so the optional-value
+        # logic correctly leaves "--last"/"--all" in place; they must be stripped
+        # as bare flags instead, or real Codex rejects "codex --last resume NEW".
+        self.assertEqual(agents.relaunch_argv("codex", self.t["codex"], "NEW", ["codex", "resume", "--last"]),
+                         ["codex", "resume", "NEW"])
+        saved = ["codex", "--model", "o4", "resume", "--all"]
+        self.assertEqual(agents.relaunch_argv("codex", self.t["codex"], "NEW", saved),
+                         ["codex", "--model", "o4", "resume", "NEW"])
+
     def test_equals_template_strips_both_forms(self):
         saved = ["omp", "--resume", "OLD", "-r", "OLD2", "--fast"]
         self.assertEqual(agents.relaunch_argv("omp", self.t["omp"], "NEW", saved),
@@ -173,6 +183,20 @@ class ValidSessionValueTest(unittest.TestCase):
     def test_control_characters_are_invalid(self):
         self.assertFalse(agents.valid_session_value("claude", "abc\ndef"))
         self.assertFalse(agents.valid_session_value("claude", "abc\x7fdef"))
+
+    def test_c1_control_characters_are_invalid(self):
+        self.assertFalse(agents.valid_session_value("claude", "abc\x80def"))
+        self.assertFalse(agents.valid_session_value("claude", "abc\x85def"))
+        self.assertFalse(agents.valid_session_value("claude", "abc\x9fdef"))
+
+    def test_path_agents_allow_up_to_4096_characters(self):
+        self.assertTrue(agents.valid_session_value("pi", "x" * 4096))
+        self.assertFalse(agents.valid_session_value("pi", "x" * 4097))
+        self.assertTrue(agents.valid_session_value("omp", "x" * 4096))
+        self.assertFalse(agents.valid_session_value("omp", "x" * 4097))
+
+    def test_other_agents_still_capped_at_512(self):
+        self.assertFalse(agents.valid_session_value("claude", "x" * 4096))
 
     def test_leading_dash_is_invalid(self):
         self.assertFalse(agents.valid_session_value("claude", "-rf"))

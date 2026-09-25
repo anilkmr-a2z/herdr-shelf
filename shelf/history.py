@@ -16,7 +16,7 @@ from .util import parse_iso
 # so a malformed or malicious one must not be able to read outside the
 # expected directory (e.g. "../../outside/secret") or contain a path
 # separator (e.g. "a/b").
-_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def claude_home() -> Path:
@@ -28,16 +28,27 @@ def codex_home() -> Path:
 
 
 def _valid_session_id(session_id: str) -> bool:
-    return isinstance(session_id, str) and bool(_SESSION_ID_RE.match(session_id))
+    # fullmatch (rather than match with a trailing "$") is required here:
+    # "$" matches just before a trailing "\n", so a match()-based check would
+    # incorrectly accept an id like "abc\n".
+    return isinstance(session_id, str) and bool(_SESSION_ID_RE.fullmatch(session_id))
 
 
 def _newest(matches: list[str]) -> Path | None:
     """The match with the latest mtime, or None. Several files can share a
     session id across projects or after a rename; the newest one is the
-    session that is actually still in use."""
-    if not matches:
-        return None
-    return max((Path(m) for m in matches), key=lambda p: p.stat().st_mtime)
+    session that is actually still in use. A match that no longer exists
+    (removed between glob() and stat()) is skipped rather than raising."""
+    best, best_mtime = None, None
+    for m in matches:
+        path = Path(m)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if best_mtime is None or mtime > best_mtime:
+            best, best_mtime = path, mtime
+    return best
 
 
 def claude_session_file(session_id: str) -> Path | None:
