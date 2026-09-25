@@ -202,6 +202,26 @@ above) if you want everything gone.
   cleanly; use `"relaunch": "plain"` for codex if you launch it that way.
 - Tabs are matched to workspaces by name. If the workspace was renamed, the tab
   comes back in a new workspace with the old name.
+- The original launch flags are lost, and the tab comes back with a plain resume
+  instead, when the agent runs under a wrapper process Shelf cannot match against
+  the agent table's program name (for example `node .../cli.js`), or when herdr
+  itself already resumed the tab once after a server restart -- herdr's own
+  resume is always plain, so the flags were already gone by the time Shelf saw
+  the pane.
+- Archiving a workspace's only tab closes the workspace along with it; restoring
+  that tab recreates the workspace.
+- History sources and transcript copies (Claude, Codex) use the herdr server's
+  own `CLAUDE_CONFIG_DIR` / `CODEX_HOME` environment, not necessarily the shell's.
+- Every command except `list` needs `HERDR_SOCKET_PATH`, so it must run inside a
+  herdr pane (or with that variable set by hand); `list` only reads the archive
+  directory and works anywhere.
+- Archives are kept until you restore or delete them. There is no automatic
+  expiry.
+- herdr 0.9.0's tab and pane ids are positional, so a tab closing elsewhere in
+  the instant between Shelf's last check and its own `tab.close` could in
+  principle shift ids onto a different tab; Shelf checks for this and skips
+  rather than closing the wrong tab, but herdr 0.9.1 or newer allocates stable
+  ids and removes the possibility entirely.
 
 ## Development
 

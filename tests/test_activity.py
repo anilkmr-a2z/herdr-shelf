@@ -96,6 +96,32 @@ class EffectiveTest(unittest.TestCase):
     def test_nothing_known(self):
         self.assertIsNone(activity.effective({}, None))
 
+    def test_first_seen_after_install_counts_even_with_history(self):
+        # A conversation resumed by hand after install: history is old, but
+        # the plugin only just noticed the session, so that counts as activity.
+        installed_at = T0 - timedelta(days=1)
+        rec = {"first_seen": stamp(T0)}
+        history_ts = T0 - timedelta(days=30)
+        self.assertEqual(activity.effective(rec, history_ts, installed_at), T0)
+
+    def test_first_seen_at_install_time_does_not_count_over_history(self):
+        # Every session already open on the first sweep gets
+        # first_seen == installed_at; for those, history alone decides.
+        installed_at = T0
+        rec = {"first_seen": stamp(T0)}
+        history_ts = T0 - timedelta(days=30)
+        self.assertEqual(activity.effective(rec, history_ts, installed_at), history_ts)
+
+    def test_first_seen_without_installed_at_is_ignored_when_history_exists(self):
+        rec = {"first_seen": stamp(T0)}
+        history_ts = T0 - timedelta(days=30)
+        self.assertEqual(activity.effective(rec, history_ts), history_ts)
+
+    def test_first_seen_alone_is_unaffected_by_installed_at_when_there_is_no_history(self):
+        installed_at = T0
+        rec = {"first_seen": stamp(T0 - timedelta(days=5))}
+        self.assertEqual(activity.effective(rec, None, installed_at), T0 - timedelta(days=5))
+
 
 class StoreAndTrackTest(unittest.TestCase):
     def setUp(self):

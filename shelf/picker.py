@@ -6,21 +6,31 @@ import shutil
 import signal
 import sys
 from datetime import datetime
+from pathlib import Path
 
-from .util import parse_iso
+from .util import FileLock, parse_iso
 
 ESC = "\x1b"
 CLEAR_SCREEN = "\033[H\033[2J"
 
+# How long the picker's delete waits for sweep.lock before giving up. A
+# module constant (rather than a literal at the call site) so tests can
+# shrink it and avoid a slow test when they intentionally hold the lock.
+DELETE_LOCK_WAIT_SECONDS = 30.0
 
-def _days_idle(record: dict, now: datetime):
+
+def days_idle(record: dict, now: datetime):
     stamps = [parse_iso(m.get("last_activity")) for m in record.get("panes", {}).values()]
     stamps = [s for s in stamps if s is not None]
     return (now - max(stamps)).days if stamps else None
 
 
-def _label(record: dict) -> str:
+def record_label(record: dict) -> str:
     return record.get("tab", {}).get("label") or record.get("workspace", {}).get("label") or "tab"
+
+
+def agent_names(record: dict) -> str:
+    return ",".join(sorted({m["agent"] for m in record.get("panes", {}).values() if m.get("agent")}))
 
 
 def _visible_rows(height=None) -> int:
@@ -46,10 +56,10 @@ def render(records: list, now: datetime, width=None, height=None) -> list:
     for number, rec in enumerate(shown, 1):
         tab = (rec.get("tab", {}).get("label") or "(unnamed)")[:tab_w]
         workspace = (rec.get("workspace", {}).get("label") or "")[:ws_w]
-        agent_names = ",".join(sorted({m["agent"] for m in rec.get("panes", {}).values() if m.get("agent")}))[:12]
-        days = _days_idle(rec, now)
+        names = agent_names(rec)[:12]
+        days = days_idle(rec, now)
         idle = "" if days is None else f"{days}d idle"
-        line = f"{number:>3}  {tab:<{tab_w}} {workspace:<{ws_w}} {agent_names:<12} {idle}".rstrip()
+        line = f"{number:>3}  {tab:<{tab_w}} {workspace:<{ws_w}} {names:<12} {idle}".rstrip()
         lines.append(line[:limit])
     remaining = len(records) - len(shown)
     if remaining > 0:
@@ -91,6 +101,7 @@ def _restore_sigint(previous) -> None:
 
 
 def run(arch, do_restore, now_fn, input_fn=input, print_fn=print, notify=lambda title, body: None) -> None:
+    state_dir = Path(arch.root).parent
     pending_message = None
     while True:
         records = arch.list()
@@ -117,9 +128,12 @@ def run(arch, do_restore, now_fn, input_fn=input, print_fn=print, notify=lambda 
             continue
         record = records[index]
         if choice == "delete":
-            answer = input_fn(f'Delete "{_label(record)}"? This cannot be undone. [y/N] ')
+            answer = input_fn(f'Delete "{record_label(record)}"? This cannot be undone. [y/N] ')
             if answer.strip().lower() in ("y", "yes"):
-                arch.delete(record["id"])
+                # Under the same lock a sweep uses, so a delete never races a
+                # sweep archiving or reading the same archive directory.
+                with FileLock(state_dir / "sweep.lock", wait_seconds=DELETE_LOCK_WAIT_SECONDS):
+                    arch.delete(record["id"])
             continue
         print_fn("Restoring...")
         previous = _ignore_sigint()

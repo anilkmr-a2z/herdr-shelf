@@ -112,6 +112,49 @@ class CaptureTest(unittest.TestCase):
         with self.assertRaises(archive.Skip):
             archive.capture(Client(fake.path), TAB, PANES, self.table, self.activity_of, True, T0)
 
+    def test_layout_with_too_many_panes_raises_skip(self):
+        fake = fake_herdr(self)
+        pane_ids = [f"w1:p{i}" for i in range(1, 26)]  # one more than herdr's 24-pane limit
+
+        def balanced(nodes):
+            if len(nodes) == 1:
+                return nodes[0]
+            mid = len(nodes) // 2
+            return {"type": "split", "direction": "right", "ratio": 0.5,
+                    "first": balanced(nodes[:mid]), "second": balanced(nodes[mid:])}
+
+        root = balanced([{"type": "pane", "pane_id": pid, "cwd": "/src"} for pid in pane_ids])
+        fake.handlers["layout.export"] = lambda p: {"layout": {
+            "workspace_id": "w1", "tab_id": "w1:t2", "zoomed": False,
+            "focused_pane_id": pane_ids[0], "root": root}}
+        panes = [{"pane_id": pid, "tab_id": "w1:t2", "terminal_id": f"term_{pid}", "cwd": "/src"}
+                 for pid in pane_ids]
+        with self.assertRaises(archive.Skip):
+            archive.capture(Client(fake.path), TAB, panes, self.table, self.activity_of, False, T0)
+
+    def test_layout_deeper_than_16_raises_skip(self):
+        fake = fake_herdr(self)
+
+        def chain(n, i=1):
+            # A split whose first side is always a leaf and whose second side
+            # nests one level deeper, so depth grows by 1 per pane without
+            # needing many panes to exceed the 16-deep limit.
+            if n == 1:
+                return {"type": "pane", "pane_id": f"w1:p{i}", "cwd": "/src"}
+            return {"type": "split", "direction": "right", "ratio": 0.5,
+                    "first": {"type": "pane", "pane_id": f"w1:p{i}", "cwd": "/src"},
+                    "second": chain(n - 1, i + 1)}
+
+        root = chain(17)  # one deeper than herdr's 16-deep limit
+        pane_ids = [f"w1:p{i}" for i in range(1, 18)]
+        fake.handlers["layout.export"] = lambda p: {"layout": {
+            "workspace_id": "w1", "tab_id": "w1:t2", "zoomed": False,
+            "focused_pane_id": pane_ids[0], "root": root}}
+        panes = [{"pane_id": pid, "tab_id": "w1:t2", "terminal_id": f"term_{pid}", "cwd": "/src"}
+                 for pid in pane_ids]
+        with self.assertRaises(archive.Skip):
+            archive.capture(Client(fake.path), TAB, panes, self.table, self.activity_of, False, T0)
+
 
 class ArchiveTabTest(unittest.TestCase):
     def setUp(self):
@@ -195,6 +238,18 @@ class ArchiveTabTest(unittest.TestCase):
         self.assertEqual(self.arch.list(), [])
         self.assertNotIn("tab.close", fake.methods())
 
+    def test_pane_list_raising_before_close_deletes_record_and_reraises(self):
+        fake = fake_herdr(self)
+
+        def raise_err(p):
+            raise FakeError("unavailable", "boom")
+
+        fake.handlers["pane.list"] = raise_err
+        with self.assertRaises(HerdrError):
+            archive.archive_tab(Client(fake.path), self.arch, TAB, PANES, self.table, self.activity_of, True, T0)
+        self.assertEqual(self.arch.list(), [])
+        self.assertNotIn("tab.close", fake.methods())
+
     def test_layout_mismatch_is_skipped_before_saving_anything(self):
         fake = fake_herdr(self)
         fake.handlers["layout.export"] = lambda p: {"layout": {
@@ -238,6 +293,14 @@ class StoreTest(unittest.TestCase):
                 self.assertEqual(arch.put_back_sessions(rec), ["projects/-x/S.jsonl", "projects/-x/S"])
                 self.assertEqual(src.read_text(), "original\n")
                 self.assertEqual((companion / "f.txt").read_text(), "f")
+
+    def test_delete_tolerates_a_missing_record_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            arch = archive.Archive(d)
+            arch.save({"id": "20260901T000000Z-aaaaaa", "archived_at": "2026-09-01T00:00:00Z"}, [])
+            (Path(d) / "archive" / "20260901T000000Z-aaaaaa" / "record.json").unlink()
+            arch.delete("20260901T000000Z-aaaaaa")  # must not raise
+            self.assertFalse((Path(d) / "archive" / "20260901T000000Z-aaaaaa").exists())
 
     def test_delete_of_an_invalid_id_raises_and_touches_nothing(self):
         with tempfile.TemporaryDirectory() as d:

@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from unittest import mock
 
 from shelf import activity, agents, archive, config, sweep
 from shelf.api import Client, HerdrError
-from shelf.util import FileLock
+from shelf.util import FileLock, iso
 from tests.fakeherdr import FakeError, FakeHerdr
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
@@ -52,6 +53,15 @@ class DecideTest(unittest.TestCase):
                     self.assertIsNone(reason)
                 else:
                     self.assertIn(expected, reason)
+
+    def test_agent_mismatched_with_its_session_is_not_eligible(self):
+        # herdr can keep a previous agent's session on a pane where a
+        # different agent now runs; that pane's own agent is "codex" but the
+        # session it's carrying still says "claude".
+        p = pane("p1")
+        p["agent"] = "codex"
+        reason = self.decide([p])
+        self.assertIn("agent does not match its session", reason)
 
 
 class RunTest(unittest.TestCase):
@@ -263,6 +273,81 @@ class RunTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.run_sweep()
         self.assertTrue((self.state / "last_sweep").exists())
+
+    def test_skip_reason_is_logged(self):
+        with self.assertLogs("shelf", level="INFO") as cm:
+            self.run_sweep()
+        self.assertTrue(any("skip here: focused" in message for message in cm.output))
+
+    def test_numeric_or_missing_tab_label_falls_back_to_workspace_label(self):
+        self.tabs.append({"tab_id": "w1:t3", "workspace_id": "w1", "label": "7", "focused": False})
+        self.panes.append(pane("w1:p3", session="OLD3", tab="w1:t3"))
+        activity.ActivityStore(self.state).update(
+            lambda d: d.update({"claude:OLD3": {"first_seen": "2026-09-01T00:00:00Z"}}))
+        report = self.run_sweep()
+        self.assertEqual(sorted(report["eligible"]), ["main/7", "old"])
+
+    def test_empty_tab_label_falls_back_to_workspace_label(self):
+        self.tabs.append({"tab_id": "w1:t3", "workspace_id": "w1", "label": "", "focused": False})
+        self.panes.append(pane("w1:p3", session="OLD3", tab="w1:t3"))
+        activity.ActivityStore(self.state).update(
+            lambda d: d.update({"claude:OLD3": {"first_seen": "2026-09-01T00:00:00Z"}}))
+        report = self.run_sweep()
+        self.assertIn("main/w1:t3", report["eligible"])
+
+
+class RecordPresenceTest(unittest.TestCase):
+    def test_working_pane_sets_last_status_so_a_later_done_event_counts(self):
+        # last_status "done" is stale here: track() never saw this session go
+        # to "working" (for example the plugin was not running then), so
+        # without this fix a following "done" would look like no change.
+        data = {"claude:S": {"first_seen": "2026-09-01T00:00:00Z", "last_status": "done"}}
+        tabs = [({}, [pane("p1", status="working", session="S")])]
+        sweep._record_presence(data, tabs, T0)
+        self.assertEqual(data["claude:S"]["last_status"], "working")
+        self.assertTrue(activity.record_status(data, "claude:S", "done", T0 + timedelta(minutes=5)))
+
+
+class InstalledAtEligibilityTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "state"
+        self.state.mkdir(parents=True)
+        self.claude = Path(self.tmp.name) / "claude"
+        env = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.claude)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.fake = FakeHerdr()
+        self.addCleanup(self.fake.close)
+        self.tabs = [
+            {"tab_id": "w1:t1", "workspace_id": "w1", "label": "seen-at-install", "focused": False},
+            {"tab_id": "w1:t2", "workspace_id": "w1", "label": "seen-after-install", "focused": False},
+        ]
+        self.panes = [pane("w1:p1", session="A", tab="w1:t1"), pane("w1:p2", session="B", tab="w1:t2")]
+        self.fake.handlers.update({
+            "tab.list": lambda p: {"tabs": [dict(t) for t in self.tabs]},
+            "pane.list": lambda p: {"panes": [dict(x) for x in self.panes]},
+            "notification.show": lambda p: {"type": "ok"},
+            "workspace.list": lambda p: {"workspaces": [{"workspace_id": "w1", "label": "main"}]},
+        })
+        old_ts = iso(T0 - timedelta(days=30))
+        for session_id in ("A", "B"):
+            f = self.claude / "projects" / "-src" / f"{session_id}.jsonl"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps({"type": "user", "timestamp": old_ts}) + "\n")
+        (self.state / "installed_at").write_text(iso(T0) + "\n")
+        activity.ActivityStore(self.state).update(lambda d: d.update({
+            "claude:A": {"first_seen": iso(T0)},  # seen at the very first sweep: installed_at itself
+            "claude:B": {"first_seen": iso(T0 + timedelta(days=9))},  # seen well after install
+        }))
+        self.cfg = config.load(None)
+
+    def test_first_seen_after_install_is_not_eligible_but_at_install_is(self):
+        now = T0 + timedelta(days=10)
+        report = sweep.run(Client(self.fake.path), self.cfg, self.state, agents.table(), now=now)
+        self.assertIn("seen-at-install", report["eligible"])
+        self.assertNotIn("seen-after-install", report["eligible"])
 
 
 class SummaryTest(unittest.TestCase):

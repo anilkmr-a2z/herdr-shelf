@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from . import activity, agents, history
+from . import activity, agents, history, picker
 from .api import HerdrError
 from .util import FileLock
 
@@ -65,7 +65,7 @@ def restore(client, arch, store, archive_id: str, table: dict, now: datetime) ->
         panes = record.get("panes", {})
         # The tab's own label is usually most specific; fall back to the
         # workspace label, then a generic word, rather than literally "None".
-        label = record["tab"].get("label") or record.get("workspace", {}).get("label") or "tab"
+        label = picker.record_label(record)
         warnings = []
         for meta in panes.values():
             if meta.get("agent") == "claude" and not history.claude_session_file(meta["session"]["value"]):
@@ -105,6 +105,7 @@ def restore(client, arch, store, archive_id: str, table: dict, now: datetime) ->
                                 created_workspace_id, close_err)
             raise
 
+        tab_id = (result.get("layout") or {}).get("tab_id")
         keys = [activity.session_key(m["agent"], m["session"]["value"])
                 for m in panes.values() if m.get("agent") and m.get("session")]
 
@@ -112,6 +113,17 @@ def restore(client, arch, store, archive_id: str, table: dict, now: datetime) ->
             for key in keys:
                 activity.mark_restored(data, key, now)
             return True
+
+        # Logged before the entry is deleted below, so if the relaunch itself
+        # then fails (the agent's own process starting up, out of Shelf's
+        # control), the session id it was relaunched with is still in
+        # shelf.log rather than gone along with the archive entry.
+        log.info("restored %s into %s", archive_id, tab_id)
+        for meta in panes.values():
+            agent = meta.get("agent")
+            if agent in table and meta.get("session", {}).get("value"):
+                argv = agents.relaunch_argv(agent, table[agent], meta["session"]["value"], meta.get("launch_argv"))
+                log.info("%s: %s", activity.session_key(agent, meta["session"]["value"]), argv)
 
         try:
             store.update(mark)
@@ -121,4 +133,4 @@ def restore(client, arch, store, archive_id: str, table: dict, now: datetime) ->
             log.warning("failed to record restored activity for %s: %s", archive_id, e)
         finally:
             arch.delete(archive_id)
-        return {"tab_id": (result.get("layout") or {}).get("tab_id"), "warnings": warnings}
+        return {"tab_id": tab_id, "warnings": warnings}

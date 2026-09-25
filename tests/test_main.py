@@ -194,6 +194,7 @@ class MainTest(unittest.TestCase):
         fake.handlers.update({
             "tab.list": lambda p: {"tabs": []},
             "pane.list": lambda p: {"panes": []},
+            "workspace.list": lambda p: {"workspaces": []},
             "notification.show": lambda p: {"type": "ok"},
         })
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}), redirect_stdout(io.StringIO()):
@@ -269,6 +270,58 @@ class MainTest(unittest.TestCase):
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(main(["open-picker"]), 0)
         self.assertEqual(fake.calls, [("plugin.pane.open", {"plugin_id": "anilkmr.shelf", "entrypoint": "picker"})])
+
+    def test_manual_archive_lock_busy_prints_friendly_message_not_the_lock_path(self):
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}), \
+                mock.patch("shelf.sweep.ARCHIVE_NOW_LOCK_WAIT_SECONDS", 0.1):
+            with FileLock(Path(self.tmp.name) / "sweep.lock"):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code = main(["archive", "w1:t1"])
+            self.assertEqual(code, 1)
+            self.assertIn("shelf: a sweep is running; try again in a moment", err.getvalue())
+            self.assertNotIn("sweep.lock", err.getvalue())
+
+    def test_restore_lock_busy_prints_friendly_message_not_the_lock_path(self):
+        archive_dir = Path(self.tmp.name) / "archive" / "20260101T000000Z-abcdef"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "record.json").write_text(json.dumps({
+            "id": "20260101T000000Z-abcdef", "archived_at": "2026-01-01T00:00:00Z",
+            "tab": {"label": "demo"}, "workspace": {"label": None}, "panes": {},
+        }))
+        with mock.patch("shelf.restore.RESTORE_LOCK_WAIT_SECONDS", 0.1), \
+                mock.patch("shelf.__main__.Client"):
+            with FileLock(Path(self.tmp.name) / "sweep.lock"):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code = main(["restore", "20260101T000000Z-abcdef"])
+            self.assertEqual(code, 1)
+            self.assertIn("shelf: a sweep is running; try again in a moment", err.getvalue())
+            self.assertNotIn("sweep.lock", err.getvalue())
+
+    def test_manual_sweep_lock_busy_prints_another_sweep_is_running(self):
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}):
+            with FileLock(Path(self.tmp.name) / "sweep.lock"):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = main(["sweep"])
+            self.assertEqual(code, 0)
+            self.assertIn("shelf: another sweep is running", out.getvalue())
+
+    def test_hook_sweep_lock_busy_prints_nothing(self):
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}):
+            with FileLock(Path(self.tmp.name) / "sweep.lock"):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = main(["sweep", "--if-due"])
+            self.assertEqual(code, 0)
+            self.assertEqual(out.getvalue(), "")
 
     def test_open_picker_notifies_when_popup_is_busy(self):
         fake = FakeHerdr()

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import activity, agents, archive, config, picker, restore, sweep
 from .api import Client, HerdrError
-from .util import FileLock, LockBusy, now, parse_iso
+from .util import FileLock, LockBusy, now
 
 PLUGIN_ID = "anilkmr.shelf"
 ALWAYS_HOOKS = ("track", "open-picker")
@@ -110,12 +110,11 @@ def _notify_config_error(state: Path, message: str) -> None:
 def _describe(rec: dict, moment) -> str:
     tab = rec.get("tab", {}).get("label") or "(unnamed)"
     workspace = rec.get("workspace", {}).get("label")
-    agent_names = ",".join(sorted({m["agent"] for m in rec.get("panes", {}).values() if m.get("agent")}))
-    stamps = [parse_iso(m.get("last_activity")) for m in rec.get("panes", {}).values()]
-    stamps = [s for s in stamps if s is not None]
-    idle = f"{(moment - max(stamps)).days}d idle" if stamps else ""
+    names = picker.agent_names(rec)
+    days = picker.days_idle(rec, moment)
+    idle = f"{days}d idle" if days is not None else ""
     parts = [tab]
-    parts.extend(p for p in (workspace, agent_names, idle) if p)
+    parts.extend(p for p in (workspace, names, idle) if p)
     return "  ".join(parts)
 
 
@@ -133,7 +132,15 @@ def main(argv=None) -> int:
         if is_hook or command == "sweep":
             _notify_config_error(state, str(e))
         return 0 if is_hook else 1
-    except (HerdrError, archive.Skip, LockBusy) as e:
+    except LockBusy as e:
+        if command in ("restore", "archive"):
+            # A user-facing, one-line reason to try again, rather than the
+            # lock file's path.
+            print("shelf: a sweep is running; try again in a moment", file=sys.stderr)
+        else:
+            log.error("%s: %s", command or "shelf", e)
+        return 0 if is_hook else 1
+    except (HerdrError, archive.Skip) as e:
         log.error("%s: %s", command or "shelf", e)
         return 0 if is_hook else 1
     except (KeyError, ValueError, OSError):
@@ -192,7 +199,14 @@ def _dispatch(command: str, args: list, state: Path) -> int:
         cfg = config.load(_config_dir())
         client = Client()
         report = sweep.run(client, cfg, state, agents.table(cfg["agents"]), if_due=if_due)
-        if report is not None and not if_due:
+        if report is None:
+            # For a manual sweep (no --if-due), run() returning None can only
+            # mean the lock was busy: the due check itself is only consulted
+            # with --if-due, where nothing needs to be printed at all.
+            if not if_due:
+                print("shelf: another sweep is running")
+            return 0
+        if not if_due:
             text = sweep.summary(report)
             print(text or "shelf: nothing to archive")
             if not text:

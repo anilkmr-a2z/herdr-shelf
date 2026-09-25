@@ -1,7 +1,7 @@
 # herdr-shelf design
 
 - Date: 2026-09-24
-- Status: draft, pending review
+- Status: implemented, v0.1.0
 - Target: herdr 0.9.0 or newer, Linux and macOS, Python 3.9 or newer, no third-party dependencies
 
 ## Problem
@@ -101,11 +101,22 @@ generic signal still applies.
 
 ### Effective activity
 
+The plugin records its own install time once, the first time any sweep (dry-run,
+live, or a manual `archive`) ever runs: an ISO timestamp written to `installed_at`
+in the state directory if that file does not already exist. Every session already
+open at that first sweep gets `first_seen` equal to this same instant.
+
 For a session, effective activity is the latest of:
 
 - the last "active now" recorded by generic tracking;
 - the history source's timestamp, if the agent has one and it succeeded;
-- `first_seen`, only when the agent has no history source or it failed;
+- `first_seen`, when the agent has no history source or it failed, exactly as
+  before; when the agent does have a history source, `first_seen` counts as
+  activity too, but only when it is strictly later than `installed_at` -- a
+  session first seen sometime after install, whose history transcript happens
+  to be old, for example a conversation resumed by hand. A session seen at the
+  very first sweep has `first_seen == installed_at` (not strictly later), so
+  for those the history timestamp alone decides;
 - `restored_at`, the last time this plugin restored the session. Without it, a
   restored tab would be archived again on the next sweep.
 
@@ -283,13 +294,23 @@ nested. All keys are optional.
 Under `HERDR_PLUGIN_STATE_DIR`:
 
 ```
-activity.json                        {"<agent>:<session>": {"first_seen", "last_active", "restored_at"}}
+activity.json                        {"<agent>:<session>": {"first_seen", "last_active", "restored_at", "last_status"}}
+activity.lock                        held while activity.json is read and rewritten
 archive/<archive-id>/record.json
 archive/<archive-id>/sessions/...    copies of Claude session files and directories
+installed_at                         ISO time of the first sweep ever run
 last_sweep                           ISO time of the last completed sweep
-sweep.lock                           held for the duration of a sweep
+sweep.lock                           held for the duration of a sweep, a restore, or a picker delete
+config-error.lock                    held while a broken config.json is reported
+config-error-notified                mtime marks the last "config.json is invalid" notification
 shelf.log                            one line per decision or error
+shelf.log.1                          shelf.log rotated out once it passes 1MB
 ```
+
+`last_status` (per session, alongside `first_seen`/`last_active`/`restored_at`) is
+the last `agent_status` recorded for that session, used to tell a real status
+change (which counts, for `blocked` and `done`) from herdr re-firing the same
+status because only a pane's title or labels changed.
 
 `activity.json` is updated under a lock with write-to-temp-and-rename, because
 `track` and `sweep` can run at the same time. `track` skips the write when the
@@ -321,6 +342,12 @@ rewriting the file on every status flip.
 
 `layout.root` is the tree returned by `layout.export`, stored as is. Records are
 written to a temporary file and renamed into place.
+
+`layout.focused_pane_id` and `layout.zoomed` are recorded as they were captured,
+but are informational only: restore does not apply either of them (`layout.apply`
+has no way to request a starting focused pane or a zoomed pane, so there is
+nothing to apply them to). They are kept in the record for a human reading it,
+not removed.
 
 ## Flows
 
@@ -356,9 +383,12 @@ written to a temporary file and renamed into place.
    eligibility on that fresh data. A single tab's failure (herdr error,
    filesystem error, or anything unexpected) is logged with its traceback and
    reported as failed; it never aborts the rest of the sweep.
-6. Write `last_sweep` and show the summary notification in a `finally`, so
-   both happen even if something above raised partway through, then release
-   the lock.
+6. Show the summary notification in a `finally`, so it happens even if
+   something above raised partway through, and exactly once. `last_sweep` is
+   written in that same `finally`, but only when the initial gather (tab.list
+   and pane.list) succeeded: if herdr could not even be listed, the next
+   check (for example a focus event) should retry rather than wait out the
+   interval. Then release the lock.
 
 ### Archive one tab
 
@@ -466,9 +496,11 @@ entry. Used for the release check and for archiving a tab by hand.
 - Hooks always exit 0. If the herdr socket is unavailable they do nothing.
 - An error on one tab is logged and the sweep continues with the next tab.
 - Errors go to `shelf.log` and to stderr, which herdr keeps in `herdr plugin log`.
-- A restore that fails to apply the layout keeps the archive entry and shows a
-  notification with the error. Once `layout.apply` has succeeded, though, the
-  tab is live and the entry is always deleted, even if recording `restored_at`
+- A restore that fails to apply the layout keeps the archive entry and shows the
+  error in the popup itself (not a notification): the picker prints "Restore
+  failed: ..." and waits for Enter before re-rendering the list, so the entry is
+  still there to retry. Once `layout.apply` has succeeded, though, the tab is
+  live and the entry is always deleted, even if recording `restored_at`
   afterward fails; that failure is only logged.
 - Locks use `fcntl.flock`, so a lock held by a process that dies is released by
   the kernel; lock files are never deleted.

@@ -87,6 +87,12 @@ class RestoreTest(unittest.TestCase):
     def run_restore(self):
         return restore.restore(Client(self.fake.path), self.arch, self.store, "20260920T000000Z-aaaaaa", agents.table(), T0)
 
+    def test_restore_logs_before_deleting_the_entry(self):
+        with self.assertLogs("shelf", level="INFO") as cm:
+            self.run_restore()
+        self.assertTrue(any("restored 20260920T000000Z-aaaaaa into w1:t7" in m for m in cm.output))
+        self.assertTrue(any("claude:S1:" in m and "--resume" in m and "S1" in m for m in cm.output))
+
     def test_into_existing_workspace(self):
         result = self.run_restore()
         apply = [p for m, p in self.fake.calls if m == "layout.apply"][0]

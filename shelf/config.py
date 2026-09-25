@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 from pathlib import Path
+
+log = logging.getLogger("shelf")
 
 DEFAULTS = {
     "idle_days": 7,
@@ -17,6 +20,8 @@ DEFAULTS = {
 
 MAX_IDLE_DAYS = 3650
 MAX_SWEEP_INTERVAL_MINUTES = 10080
+
+AGENT_KEYS = frozenset({"program", "resume", "strip", "strip_bare", "strip_subcommand", "relaunch"})
 
 
 class ConfigError(Exception):
@@ -40,6 +45,9 @@ def load(config_dir) -> dict:
         raise ConfigError(f"{path}: {e}") from e
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: the top level must be an object")
+    unknown = sorted(set(raw) - set(DEFAULTS))
+    if unknown:
+        log.warning("%s: ignoring unknown key(s): %s", path, ", ".join(unknown))
     for key in DEFAULTS:
         if key in raw:
             cfg[key] = raw[key]
@@ -74,10 +82,16 @@ def _is_str_list(value) -> bool:
 
 
 def _validate_agent(name: str, entry: dict, path: Path) -> None:
-    if "program" in entry and not isinstance(entry["program"], str):
-        raise ConfigError(f"{path}: agents.{name}.program must be a string")
-    if "resume" in entry and not (_is_str_list(entry["resume"]) and entry["resume"]):
-        raise ConfigError(f"{path}: agents.{name}.resume must be a non-empty list of strings")
+    unknown = sorted(set(entry) - AGENT_KEYS)
+    if unknown:
+        log.warning("%s: agents.%s: ignoring unknown key(s): %s", path, name, ", ".join(unknown))
+    if "program" in entry and not (isinstance(entry["program"], str) and entry["program"]):
+        raise ConfigError(f"{path}: agents.{name}.program must be a non-empty string")
+    if "resume" in entry:
+        if not (_is_str_list(entry["resume"]) and entry["resume"]):
+            raise ConfigError(f"{path}: agents.{name}.resume must be a non-empty list of strings")
+        if not any("{id}" in item for item in entry["resume"]):
+            raise ConfigError(f'{path}: agents.{name}.resume must contain "{{id}}" in at least one element')
     if "strip" in entry and not _is_str_list(entry["strip"]):
         raise ConfigError(f"{path}: agents.{name}.strip must be a list of strings")
     if "strip_bare" in entry and not _is_str_list(entry["strip_bare"]):

@@ -88,10 +88,26 @@ def mark_restored(data: dict, key: str, now: datetime) -> bool:
     return True
 
 
-def effective(rec: dict, history_ts: datetime | None) -> datetime | None:
-    """Latest of last_active, restored_at, and either history or first_seen."""
+def effective(rec: dict, history_ts: datetime | None, installed_at: datetime | None = None) -> datetime | None:
+    """Latest of last_active, restored_at, and either history or first_seen.
+
+    When a history source has a timestamp, first_seen only counts in
+    addition to it when it is strictly later than installed_at -- a session
+    seen for the first time after the plugin was installed, whose transcript
+    (history) happens to be old, for example a conversation resumed by hand.
+    A session first seen at install time (first_seen == installed_at, as
+    every session already open on the first sweep is) leaves history alone
+    to decide. Without installed_at (unknown), first_seen is not counted
+    alongside history, matching that same "seen at install" behavior.
+    """
     candidates = [parse_iso(rec.get("last_active")), parse_iso(rec.get("restored_at"))]
-    candidates.append(history_ts if history_ts is not None else parse_iso(rec.get("first_seen")))
+    first_seen = parse_iso(rec.get("first_seen"))
+    if history_ts is not None:
+        candidates.append(history_ts)
+        if first_seen is not None and installed_at is not None and first_seen > installed_at:
+            candidates.append(first_seen)
+    else:
+        candidates.append(first_seen)
     present = [c for c in candidates if c is not None]
     return max(present) if present else None
 

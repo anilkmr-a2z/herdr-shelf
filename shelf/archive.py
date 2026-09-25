@@ -27,6 +27,14 @@ class Skip(Exception):
     """The tab cannot be archived right now. Nothing was changed."""
 
 
+# herdr's own layout.apply limits (src/app/api/layouts.rs MAX_LAYOUT_PANES,
+# MAX_LAYOUT_DEPTH). A layout past either limit could never be restored, so
+# capture() refuses to archive it rather than write a record that layout.apply
+# would reject on restore.
+MAX_LAYOUT_PANES = 24
+MAX_LAYOUT_DEPTH = 16
+
+
 def _fsync_dir(path: Path) -> None:
     try:
         fd = os.open(str(path), os.O_RDONLY)
@@ -87,7 +95,10 @@ class Archive:
 
     def delete(self, archive_id: str) -> None:
         folder = self._dir(archive_id)
-        (folder / "record.json").unlink()
+        try:
+            (folder / "record.json").unlink()
+        except FileNotFoundError:
+            pass
         shutil.rmtree(folder, ignore_errors=True)
 
     def put_back_sessions(self, record: dict) -> list:
@@ -159,7 +170,18 @@ def _pane_ids(node: dict) -> set:
     return {pid} if pid else set()
 
 
-def _pane_terminals(panes: list) -> frozenset:
+def _layout_stats(node: dict, depth: int = 1) -> tuple:
+    """(pane count, max depth), counted the same way herdr's layout.apply does
+    (root at depth 1), so a layout that would fail to restore is caught here
+    instead of producing an archive that can never come back."""
+    if node.get("type") == "split":
+        panes1, depth1 = _layout_stats(node["first"], depth + 1)
+        panes2, depth2 = _layout_stats(node["second"], depth + 1)
+        return panes1 + panes2, max(depth1, depth2)
+    return 1, depth
+
+
+def pane_terminals(panes: list) -> frozenset:
     return frozenset(p["terminal_id"] for p in panes if p.get("terminal_id"))
 
 
@@ -187,6 +209,11 @@ def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_trans
         # herdr 0.9.0 tab/pane ids are positional: a close elsewhere between
         # our gather() and this call can make tab_id now mean a different tab.
         raise Skip("layout does not match the tab's panes")
+    pane_count, max_depth = _layout_stats(layout["root"])
+    if pane_count > MAX_LAYOUT_PANES:
+        raise Skip(f"layout has {pane_count} panes; herdr's limit is {MAX_LAYOUT_PANES}")
+    if max_depth > MAX_LAYOUT_DEPTH:
+        raise Skip(f"layout depth is {max_depth}; herdr's limit is {MAX_LAYOUT_DEPTH}")
     workspace_label = _workspace_label(client, tab["workspace_id"])
     pane_meta, session_files, copies = {}, [], []
     for pane in panes:
@@ -231,8 +258,16 @@ def archive_tab(client, arch: Archive, tab: dict, panes: list, table: dict, acti
     """Write the record, verify the tab is unchanged, then close it. Returns the archive id."""
     record, session_files = capture(client, tab, panes, table, activity_of, keep_transcripts, now)
     arch.save(record, session_files)
-    expected_terminals = _pane_terminals(panes)
-    if _tab_terminals(client, tab["tab_id"]) != expected_terminals:
+    expected_terminals = pane_terminals(panes)
+    try:
+        terminals_now = _tab_terminals(client, tab["tab_id"])
+    except BaseException:
+        # Whatever went wrong, the record must not be left behind as an
+        # orphan: the tab was never closed, so this record would be a
+        # duplicate of a tab that is still open.
+        arch.delete(record["id"])
+        raise
+    if terminals_now != expected_terminals:
         # Another tab closing between our gather() and here can shift
         # herdr's positional ids onto a different tab; closing tab_id now
         # would close the wrong thing, so back out instead.

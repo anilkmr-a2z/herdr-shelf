@@ -1,8 +1,11 @@
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest import mock
 
 from shelf import picker
+from shelf.util import FileLock, LockBusy
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
 RECORDS = [
@@ -14,9 +17,10 @@ RECORDS = [
 
 
 class FakeArchive:
-    def __init__(self, records):
+    def __init__(self, records, root=None):
         self.records = list(records)
         self.deleted = []
+        self.root = root or Path(tempfile.mkdtemp(prefix="shelf-picker-test-")) / "archive"
 
     def list(self):
         return list(self.records)
@@ -113,6 +117,16 @@ class RunTest(unittest.TestCase):
         arch, restored, _, _ = self.run_picker(["d2", "", "q"])
         self.assertEqual(arch.deleted, [])
         self.assertEqual(restored, [])
+
+    def test_delete_runs_under_the_sweep_lock(self):
+        arch = FakeArchive(RECORDS)
+        with FileLock(arch.root.parent / "sweep.lock"), \
+                mock.patch("shelf.picker.DELETE_LOCK_WAIT_SECONDS", 0.1):
+            answers = iter(["d2", "y", "q"])
+            with self.assertRaises(LockBusy):
+                picker.run(arch, lambda archive_id: {"tab_id": "t", "warnings": []}, lambda: T0,
+                           input_fn=lambda prompt: next(answers), print_fn=lambda *_: None)
+        self.assertEqual(arch.deleted, [])
 
     def test_invalid_reprompts(self):
         _, restored, out, _ = self.run_picker(["9", "1"])

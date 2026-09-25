@@ -49,12 +49,42 @@ class ConfigTest(unittest.TestCase):
             {"agents": {"x": {"resume": "--load {id}"}}},
             {"agents": {"x": {"relaunch": "fancy"}}},
             {"agents": {"x": {"strip": "-r"}}},
+            {"agents": {"x": {"program": ""}}},
+            {"agents": {"x": {"resume": ["--load"]}}},
         ]
         for bad in bad_values:
             with self.subTest(bad=bad), tempfile.TemporaryDirectory() as d:
                 self.write(d, bad)
                 with self.assertRaises(config.ConfigError):
                     config.load(d)
+
+    def test_unknown_top_level_keys_are_warned_not_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"colour": "blue"})
+            with self.assertLogs("shelf", level="WARNING") as cm:
+                cfg = config.load(d)
+        self.assertNotIn("colour", cfg)
+        self.assertTrue(any("colour" in m for m in cm.output))
+
+    def test_unknown_agent_keys_are_warned_not_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"agents": {"qwen": {"relaunch": "plain", "nickname": "Q"}}})
+            with self.assertLogs("shelf", level="WARNING") as cm:
+                cfg = config.load(d)
+        self.assertEqual(cfg["agents"], {"qwen": {"relaunch": "plain", "nickname": "Q"}})
+        self.assertTrue(any("nickname" in m for m in cm.output))
+
+    def test_resume_must_contain_the_id_placeholder(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"agents": {"x": {"program": "x", "resume": ["--load", "now"]}}})
+            with self.assertRaises(config.ConfigError):
+                config.load(d)
+
+    def test_resume_with_id_placeholder_is_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"agents": {"x": {"program": "x", "resume": ["--load", "{id}"]}}})
+            cfg = config.load(d)
+        self.assertEqual(cfg["agents"]["x"]["resume"], ["--load", "{id}"])
 
 
 if __name__ == "__main__":
