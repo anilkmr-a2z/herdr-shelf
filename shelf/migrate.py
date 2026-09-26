@@ -19,6 +19,7 @@ from __future__ import annotations
 import filecmp
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -31,6 +32,19 @@ log = logging.getLogger("shelf")
 # invocation to retry) rather than blocking indefinitely.
 LOCK_WAIT_SECONDS = 10.0
 
+# Matches archive.py's own archive-id shape exactly (full match, unlike
+# archive.py's own prefix-only _ID_RE): only a directory named like this is
+# ever treated as an archive entry during migration. Anything else under
+# root/archive/ -- a stray file such as macOS's .DS_Store, or a directory
+# with some other name -- is left alone entirely: not migrated, not
+# compared for a collision, not warned about, and not counted as legacy
+# state remaining.
+_ARCHIVE_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
+
+
+def _is_archive_entry(entry: Path) -> bool:
+    return bool(_ARCHIVE_ID_RE.match(entry.name)) and entry.is_dir()
+
 
 def root_legacy_present(root: Path) -> bool:
     """Cheap, lock-free check: is there any pre-0.3.0 root-level state left
@@ -41,7 +55,7 @@ def root_legacy_present(root: Path) -> bool:
         return True
     archive_dir = root / "archive"
     try:
-        return archive_dir.is_dir() and any(archive_dir.iterdir())
+        return archive_dir.is_dir() and any(_is_archive_entry(e) for e in archive_dir.iterdir())
     except OSError:
         return False
 
@@ -138,6 +152,8 @@ def _merge_archive(root: Path, default_dir: Path) -> bool:
     dest_root = default_dir / "archive"
     moved_any = False
     for entry in sorted(src_root.iterdir()):
+        if not _is_archive_entry(entry):
+            continue  # a stray file or oddly-named entry: leave it alone
         dest = dest_root / entry.name
         if dest.exists():
             try:

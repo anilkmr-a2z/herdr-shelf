@@ -54,6 +54,14 @@ class RootLegacyPresentTest(unittest.TestCase):
             (Path(d) / "archive" / "20260101T000000Z-aaaaaa").mkdir(parents=True)
             self.assertTrue(migrate.root_legacy_present(Path(d)))
 
+    def test_archive_dir_with_only_a_stray_file_does_not_count(self):
+        # A stray file (e.g. macOS's .DS_Store) is not an archive entry and
+        # must not be mistaken for legacy state left to migrate.
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "archive").mkdir(parents=True)
+            (Path(d) / "archive" / ".DS_Store").write_text("")
+            self.assertFalse(migrate.root_legacy_present(Path(d)))
+
     def test_unrelated_sessions_dir_does_not_count(self):
         # A subdirectory for some other (possibly disabled) herdr session
         # existing already must not be mistaken for root-level legacy state.
@@ -206,6 +214,82 @@ class MergeIntoDefaultSessionTest(unittest.TestCase):
         self.assertTrue((self.root / "archive.conflict" / "20260101T000000Z-aaaaaa" / "record.json").exists())
         self.assertFalse((self.root / "archive" / "20260102T000000Z-bbbbbb").exists())
         self.assertFalse((self.root / "archive" / "20260101T000000Z-aaaaaa").exists())
+
+    # -- Stray, non-archive entries in root archive/ (e.g. macOS's
+    # .DS_Store) are left alone entirely: not migrated, not warned about,
+    # and not counted as remaining legacy state. --
+
+    def test_stray_file_in_root_archive_is_left_untouched(self):
+        self.write_archive(self.root, "20260101T000000Z-aaaaaa", "old")
+        (self.root / "archive" / ".DS_Store").write_text("junk")
+
+        handler = _CapturingHandler()
+        log = logging.getLogger("shelf")
+        log.addHandler(handler)
+        try:
+            migrate.merge_into_default_session(self.root)
+        finally:
+            log.removeHandler(handler)
+
+        # The real archive still migrates and logs its own info line; only
+        # a warning or error about the stray file would be a problem.
+        self.assertFalse(any(r.levelno >= logging.WARNING for r in handler.records), handler.records)
+        self.assertTrue((self.default / "archive" / "20260101T000000Z-aaaaaa" / "record.json").exists())
+        self.assertFalse((self.root / "archive" / "20260101T000000Z-aaaaaa").exists())
+        self.assertEqual((self.root / "archive" / ".DS_Store").read_text(), "junk")
+
+    def test_stray_file_also_in_destination_is_ignored(self):
+        self.write_archive(self.root, "20260101T000000Z-aaaaaa", "old")
+        (self.root / "archive" / ".DS_Store").write_text("root-junk")
+        (self.default / "archive").mkdir(parents=True)
+        (self.default / "archive" / ".DS_Store").write_text("dest-junk")
+
+        handler = _CapturingHandler()
+        log = logging.getLogger("shelf")
+        log.addHandler(handler)
+        try:
+            migrate.merge_into_default_session(self.root)
+        finally:
+            log.removeHandler(handler)
+
+        self.assertFalse(any(r.levelno >= logging.WARNING for r in handler.records), handler.records)
+        self.assertTrue((self.default / "archive" / "20260101T000000Z-aaaaaa" / "record.json").exists())
+        # Neither stray file was touched -- no collision handling was even
+        # attempted for a non-archive entry.
+        self.assertEqual((self.root / "archive" / ".DS_Store").read_text(), "root-junk")
+        self.assertEqual((self.default / "archive" / ".DS_Store").read_text(), "dest-junk")
+
+    def test_stray_directory_with_a_non_matching_name_is_left_untouched(self):
+        self.write_archive(self.root, "20260101T000000Z-aaaaaa", "old")
+        (self.root / "archive" / "not-an-archive-id").mkdir()
+        (self.root / "archive" / "not-an-archive-id" / "note.txt").write_text("hello")
+
+        handler = _CapturingHandler()
+        log = logging.getLogger("shelf")
+        log.addHandler(handler)
+        try:
+            migrate.merge_into_default_session(self.root)
+        finally:
+            log.removeHandler(handler)
+
+        self.assertFalse(any(r.levelno >= logging.WARNING for r in handler.records), handler.records)
+        self.assertTrue((self.root / "archive" / "not-an-archive-id" / "note.txt").exists())
+
+    def test_second_run_with_only_a_stray_file_left_logs_nothing(self):
+        self.write_archive(self.root, "20260101T000000Z-aaaaaa", "old")
+        (self.root / "archive" / ".DS_Store").write_text("junk")
+        migrate.merge_into_default_session(self.root)  # first run: migrates the real archive
+
+        handler = _CapturingHandler()
+        log = logging.getLogger("shelf")
+        log.addHandler(handler)
+        try:
+            migrate.merge_into_default_session(self.root)  # second run
+        finally:
+            log.removeHandler(handler)
+
+        self.assertEqual(handler.records, [])
+        self.assertEqual((self.root / "archive" / ".DS_Store").read_text(), "junk")
 
     def test_rollback_scenario_migrates_new_archives_on_a_later_run(self):
         # First upgrade: migrate one archive.
