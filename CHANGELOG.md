@@ -15,19 +15,30 @@
   `sessions` is configured otherwise. A herdr session not in `sessions`
   gets no hooks, no sweeps, and no manual command: `track`, `sweep
   --if-due`, and the startup sweep return immediately and write nothing;
-  `open-picker` shows a notification instead of opening the popup; the
-  manual `sweep`, `archive`, `list`, `restore` and `pick` commands print
-  (or, for `pick`, show in the popup) that the session is not enabled and
-  exit 1.
+  `open-picker`, and the manual `sweep` (the `sweep-now` action), show a
+  notification instead of opening the popup or sweeping; the manual
+  `sweep`, `archive`, `list` and `restore` commands print that the session
+  is not enabled and exit 1; `pick` shows that message in its own popup and
+  waits for Enter, exiting 0 like its other error screens. A socket path
+  that clearly names a session but from which no valid name can be parsed
+  is always disabled, never treated as `"default"`.
 - State is now kept separately per herdr session, under
   `sessions/<name>/` in the plugin's state directory (`archive/`,
   `activity.json`, `activity.lock`, `last_sweep`, `sweep.lock`,
   `installed_at`); `shelf.log`, `shelf.log.1`, `config-error-notified` and
-  `config-error.lock` stay at the state directory's root. Existing state
-  from before this release is moved into `sessions/default/` automatically,
-  once, the first time any command runs after upgrading.
+  `config-error.lock` stay at the state directory's root. State from
+  before this release is merged into `sessions/default/` automatically --
+  self-healing, so it keeps retrying on later commands rather than assuming
+  one pass finished the job, and safe against a downgrade-then-upgrade
+  round trip. This runs for every herdr session, including a disabled one,
+  since it is a shared, one-time cleanup rather than a per-session
+  concern; pre-0.3.0 archives from any herdr session all land in
+  `sessions/default/`, so they are hidden if `"default"` is ever removed
+  from `sessions`.
 - `shelf.log` lines now include the herdr session name, for example
   `... INFO [default] archived old`.
+- New archive records carry an informational `"herdr_session"` field
+  naming the herdr session they were archived from.
 
 ## 0.2.1 - 2026-09-25
 

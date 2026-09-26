@@ -200,8 +200,13 @@ def _tab_with_terminals_exists(client, terminals: frozenset) -> bool:
     return terminals in (frozenset(v) for v in by_tab.values())
 
 
-def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_transcripts: bool, now: datetime):
-    """Build the archive record for a tab. Returns (record, session_files)."""
+def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_transcripts: bool, now: datetime,
+           herdr_session: str = "default"):
+    """Build the archive record for a tab. Returns (record, session_files).
+
+    herdr_session is informational only: the herdr session this tab was
+    archived from, recorded on the record for a human reading it later.
+    """
     layout = client.call("layout.export", {"tab_id": tab["tab_id"]}).get("layout")
     if not layout or "root" not in layout:
         raise Skip("layout.export returned no layout")
@@ -249,14 +254,15 @@ def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_trans
                    "zoomed": bool(layout.get("zoomed"))},
         "panes": pane_meta,
         "session_copies": copies,
+        "herdr_session": herdr_session,
     }
     return record, session_files
 
 
 def archive_tab(client, arch: Archive, tab: dict, panes: list, table: dict, activity_of,
-                keep_transcripts: bool, now: datetime) -> str:
+                keep_transcripts: bool, now: datetime, herdr_session: str = "default") -> str:
     """Write the record, verify the tab is unchanged, then close it. Returns the archive id."""
-    record, session_files = capture(client, tab, panes, table, activity_of, keep_transcripts, now)
+    record, session_files = capture(client, tab, panes, table, activity_of, keep_transcripts, now, herdr_session)
     arch.save(record, session_files)
     expected_terminals = pane_terminals(panes)
     try:

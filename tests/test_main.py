@@ -15,6 +15,35 @@ from shelf.util import FileLock, iso, now
 from tests.fakeherdr import FakeError, FakeHerdr
 
 
+def _restorable_record(archive_id: str, session_value: str = "S1") -> dict:
+    """A minimal record.json that restore.restore can actually apply: one
+    claude pane with a valid session id, no splits."""
+    return {
+        "version": 1, "id": archive_id, "archived_at": "2026-01-01T00:00:00Z",
+        "workspace": {"label": None, "cwd": None},
+        "tab": {"label": "demo"},
+        "layout": {"focused_pane_id": "p1", "zoomed": False,
+                   "root": {"type": "pane", "pane_id": "p1"}},
+        "panes": {"p1": {"cwd": None, "agent": "claude",
+                         "session": {"kind": "id", "value": session_value, "source": "herdr:claude"},
+                         "launch_argv": ["claude"], "last_activity": "2026-01-01T00:00:00Z"}},
+        "session_copies": [],
+    }
+
+
+def _restore_handlers(tab_id: str = "w9:t1") -> dict:
+    """FakeHerdr handlers sufficient for restore.restore to succeed: no
+    matching workspace (so one is created), no live panes anywhere."""
+    return {
+        "workspace.list": lambda p: {"workspaces": []},
+        "workspace.create": lambda p: {"type": "workspace_created",
+                                       "workspace": {"workspace_id": "w9", "label": p.get("label")},
+                                       "tab": {"tab_id": tab_id}, "root_pane": {"pane_id": "w9:p1"}},
+        "layout.apply": lambda p: {"type": "layout_apply", "layout": {"tab_id": tab_id}},
+        "pane.list": lambda p: {"panes": []},
+    }
+
+
 class MainTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -112,6 +141,25 @@ class MainTest(unittest.TestCase):
         log_path = Path(self.tmp.name) / "shelf.log"
         self.assertTrue(log_path.exists())
         self.assertIn("pick failed", log_path.read_text())
+
+    def test_pick_passes_input_fn_explicitly_so_mocking_builtins_input_works(self):
+        # picker.run's own input_fn parameter defaults to the *original*
+        # input builtin, bound once when picker.py was first imported --
+        # long before any test's mock.patch("builtins.input") runs. If
+        # _pick ever calls picker.run() without passing input_fn (relying
+        # on that default), a test patching builtins.input has no effect on
+        # it, and a real "pick" invocation with an unmocked, blocking stdin
+        # would hang instead of failing fast (caught by running the suite
+        # with stdin attached to a non-EOF, terminal-like source, where
+        # this exact gap once hung test_pick_lists_archives_from_the_
+        # session_dir_not_the_root). This test catches a regression of that
+        # without needing a blocking stdin itself.
+        with mock.patch("shelf.__main__.picker.run") as picker_run, \
+                mock.patch("shelf.__main__.Client"), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["pick"]), 0)
+        picker_run.assert_called_once()
+        self.assertIs(picker_run.call_args.kwargs.get("input_fn"), input)
+        self.assertIs(picker_run.call_args.kwargs.get("print_fn"), print)
 
     def test_unknown_command(self):
         with redirect_stderr(io.StringIO()):
@@ -420,10 +468,24 @@ class SessionAllowlistTest(unittest.TestCase):
     # -- Hooks: a disabled session returns 0 immediately and writes nothing. --
 
     def test_disabled_hook_track_writes_no_state(self):
-        self.use_cao_socket()
-        with redirect_stderr(io.StringIO()):
+        # A real, well-formed pane.agent_status_changed payload -- with a
+        # working pane.get behind it -- so that if the gate were ever
+        # removed, activity.track would genuinely succeed and write
+        # activity.json. Without a real payload this test would still pass
+        # even with the gate removed, since track() is a no-op on an empty
+        # event regardless -- see the mutation checks in the commit body.
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        fake.handlers["pane.get"] = lambda p: {
+            "pane": {"agent_session": {"agent": "claude", "kind": "id", "value": "S1", "source": "herdr:claude"}}}
+        self.use_cao_socket_linked_to(fake)
+        event_json = json.dumps({"event": "pane_agent_status_changed",
+                                 "data": {"pane_id": "p1", "agent_status": "done"}})
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": event_json, "HERDR_PANE_ID": "p1"}), \
+                redirect_stderr(io.StringIO()):
             self.assertEqual(main(["track"]), 0)
         self.assertFalse(self.cao_session.exists())
+        self.assertNotIn("pane.get", fake.methods())
 
     def test_disabled_hook_sweep_if_due_writes_no_state(self):
         self.use_cao_socket()
@@ -471,6 +533,18 @@ class SessionAllowlistTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("shelf is not enabled for herdr session 'cao'", err.getvalue())
         self.assertIn('add it to "sessions" in config.json', err.getvalue())
+
+    def test_disabled_manual_sweep_prints_message_even_with_no_socket_path_at_all(self):
+        # The best-effort notification must never swallow the printed
+        # message: Client() itself raises here (no HERDR_SOCKET_PATH), and
+        # that must not stop the message below it from being printed.
+        self.write_config({"sessions": ["work"]})
+        os.environ.pop("HERDR_SOCKET_PATH", None)  # -> "default", not "work"
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = main(["sweep"])
+        self.assertEqual(code, 1)
+        self.assertIn("shelf is not enabled for herdr session 'default'", err.getvalue())
 
     def test_disabled_manual_archive_prints_message_and_exits_one(self):
         self.use_cao_socket()
@@ -538,6 +612,76 @@ class SessionAllowlistTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("not enabled", err.getvalue())
 
+    def test_unparseable_session_path_is_always_disabled_even_with_star(self):
+        # A socket path that clearly names a session but has no name
+        # between "sessions" and "herdr.sock" resolves to None, which must
+        # never be enabled -- not even by "*".
+        self.write_config({"sessions": ["*"]})
+        path = os.path.join(self.tmp.name, "herdr-config", "sessions", "herdr.sock")
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = main(["list"])
+        self.assertEqual(code, 1)
+        self.assertIn("shelf is not enabled for herdr session 'unknown'", err.getvalue())
+
+    def test_unparseable_session_path_logs_with_the_unknown_tag(self):
+        # open-picker's disabled path calls notification.show; with no real
+        # socket behind this path, that failure is what actually produces a
+        # log line to check the session tag on.
+        path = os.path.join(self.tmp.name, "herdr-config", "sessions", "herdr.sock")
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["open-picker"]), 0)
+        log_text = (self.root / "shelf.log").read_text()
+        self.assertIn("[unknown]", log_text)
+
+    # -- Mutation-resistance: each of these fails if the corresponding
+    # per-session wiring is broken, not just if the gate is broken. --
+
+    def test_restore_records_activity_under_the_session_dir_not_the_root(self):
+        self.write_config({"sessions": ["default", "cao"]})
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        fake.handlers.update(_restore_handlers())
+        self.use_cao_socket_linked_to(fake)
+        archive_dir = self.cao_session / "archive" / "20260101T000000Z-abcdef"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "record.json").write_text(json.dumps(_restorable_record("20260101T000000Z-abcdef")))
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = main(["restore", "20260101T000000Z-abcdef"])
+
+        self.assertEqual(code, 0)
+        session_activity = json.loads((self.cao_session / "activity.json").read_text())
+        self.assertEqual(session_activity["claude:S1"]["restored_at"], iso(now()))
+        self.assertFalse((self.root / "activity.json").exists())
+
+    def test_pick_lists_archives_from_the_session_dir_not_the_root(self):
+        self.write_config({"sessions": ["default", "cao"]})
+        self.use_cao_socket()
+        archive_dir = self.cao_session / "archive" / "20260101T000000Z-abcdef"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "record.json").write_text(json.dumps({
+            "id": "20260101T000000Z-abcdef", "archived_at": "2026-01-01T00:00:00Z",
+            "tab": {"label": "distinctive-label"}, "workspace": {"label": None}, "panes": {},
+        }))
+        out = io.StringIO()
+        with mock.patch("builtins.input", return_value="q"), redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["pick"]), 0)
+        self.assertIn("distinctive-label", out.getvalue())
+
+    def test_invalid_config_fallback_does_not_enable_other_sessions(self):
+        # "sessions" is absent, and idle_days is invalid: the gate's
+        # fallback must be exactly ["default"], not something permissive
+        # like ["*"] -- "cao" must stay disabled.
+        self.write_config({"idle_days": -1})
+        self.use_cao_socket()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(["list"])
+        self.assertEqual(code, 1)
+        self.assertIn("shelf is not enabled for herdr session 'cao'", err.getvalue())
+
     # -- Logging includes the herdr session name. --
 
     def test_log_line_includes_the_herdr_session_name(self):
@@ -549,7 +693,8 @@ class SessionAllowlistTest(unittest.TestCase):
         self.assertIn("[cao]", log_text)
 
     def test_log_line_includes_the_default_session_name(self):
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        with mock.patch("builtins.input", side_effect=EOFError), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(main(["pick"]), 0)
         log_text = (self.root / "shelf.log").read_text()
         self.assertIn("[default]", log_text)
@@ -618,6 +763,49 @@ class MigrationTest(unittest.TestCase):
             self.assertEqual(main(["list"]), 0)
         self.assertIn("No archived tabs.", out.getvalue())
         self.assertFalse((self.root / "sessions").exists())
+
+    def test_migrated_archive_can_be_restored(self):
+        # Not just listable (test_migration_moves_legacy_files_into_...
+        # above) but actually restorable, end to end, from sessions/default.
+        self.root.mkdir(parents=True, exist_ok=True)
+        archive_dir = self.root / "archive" / "20260101T000000Z-abcdef"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "record.json").write_text(json.dumps(_restorable_record("20260101T000000Z-abcdef")))
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        fake.handlers.update(_restore_handlers())
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}):
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                code = main(["restore", "20260101T000000Z-abcdef"])
+        self.assertEqual(code, 0)
+        self.assertIn("w9:t1", out.getvalue())
+        self.assertFalse((self.root / "sessions" / "default" / "archive" / "20260101T000000Z-abcdef").exists())
+        self.assertFalse((self.root / "archive").exists())
+
+    def test_rollback_then_upgrade_migrates_the_new_archive_too(self):
+        # First upgrade: migrate one archive via a real command.
+        self.write_legacy_state()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["list"]), 0)
+        self.assertFalse((self.root / "archive").exists())
+
+        # Rollback to 0.2.x (which only knows the root-level layout) and use
+        # it: it archives a second tab directly at the root.
+        second = self.root / "archive" / "20260102T000000Z-bbbbbb"
+        second.mkdir(parents=True)
+        (second / "record.json").write_text(json.dumps({
+            "id": "20260102T000000Z-bbbbbb", "archived_at": "2026-01-02T00:00:00Z",
+            "tab": {"label": "also-old"}, "workspace": {"label": None}, "panes": {},
+        }))
+
+        # Upgrade again: a later command must still pick up the new one.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(main(["list"]), 0)
+        self.assertIn("20260102T000000Z-bbbbbb  also-old", out.getvalue())
+        self.assertIn("20260101T000000Z-abcdef  demo", out.getvalue())
+        self.assertFalse((self.root / "archive").exists())
 
 
 if __name__ == "__main__":

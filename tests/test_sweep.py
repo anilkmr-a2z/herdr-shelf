@@ -165,7 +165,15 @@ class RunTest(unittest.TestCase):
         report = self.run_sweep()
         self.assertEqual(report["archived"], ["old"])
         self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
-        self.assertEqual(len(archive.Archive(self.state).list()), 1)
+        records = archive.Archive(self.state).list()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["herdr_session"], "default")
+
+    def test_live_archives_carries_the_given_herdr_session(self):
+        self.cfg["mode"] = "live"
+        self.run_sweep(herdr_session="cao")
+        records = archive.Archive(self.state).list()
+        self.assertEqual(records[0]["herdr_session"], "cao")
 
     def test_live_resolves_the_tab_again_by_terminal(self):
         self.cfg["mode"] = "live"
@@ -202,6 +210,13 @@ class RunTest(unittest.TestCase):
         archive_id = sweep.archive_now(Client(self.fake.path), self.cfg, self.state, agents.table(), "w1:t1", now=T0)
         self.assertTrue(archive_id)
         self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+        self.assertEqual(archive.Archive(self.state).load(archive_id)["herdr_session"], "default")
+
+    def test_archive_now_carries_the_given_herdr_session(self):
+        self.panes[0]["agent_session"]["value"] = "NEVER_SEEN"
+        archive_id = sweep.archive_now(Client(self.fake.path), self.cfg, self.state, agents.table(), "w1:t1", now=T0,
+                                       herdr_session="cao")
+        self.assertEqual(archive.Archive(self.state).load(archive_id)["herdr_session"], "cao")
 
     def test_archive_now_refuses_focused_and_missing(self):
         with self.assertRaises(archive.Skip):

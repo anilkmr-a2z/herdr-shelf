@@ -156,16 +156,24 @@ names Shelf is allowed to act in. It defaults to `["default"]`, so Shelf
 only ever touches the default session unless you add more. `"*"` allows
 every session. A session not in the list gets no hooks, no sweeps, and no
 manual command: `track`, `sweep --if-due` and the startup sweep return
-immediately without writing anything; `open-picker` shows a notification
-saying so instead of opening the popup; and the manual `sweep`, `archive`,
-`list`, `restore` and `pick` commands print (or, for `pick`, show in the
-popup) that the session is not enabled and exit 1.
+immediately without writing anything; `open-picker`, and the manual
+`sweep` (the `sweep-now` action), show a notification saying so instead of
+sweeping or opening the popup; and the manual `sweep`, `archive`, `list`
+and `restore` commands print that the session is not enabled and exit 1.
+`pick` instead shows that same message in its own popup and waits for
+Enter, like its other error screens, then exits 0 -- it is a popup pane,
+not a script whose exit code anything checks.
 
 Add a named session to `sessions` if you want Shelf to manage tabs there too.
 Leave out any session whose agents are managed by another tool -- for
 example a session a separate automation tool runs its own agents in --
 since archiving one of its tabs would take that tab away from the tool
 managing it, out from under it.
+
+Migration to per-session state (see "Where things live" below) runs
+regardless of `sessions`: it is a one-time, shared, root-level cleanup, not
+tied to any one session's allowlist, so it also runs -- and logs to the
+shared `shelf.log` -- from a disabled session's hooks.
 
 Each herdr session keeps its own archive, activity history and sweep
 schedule; see "Where things live" below.
@@ -205,9 +213,20 @@ State: `$XDG_STATE_HOME/herdr/plugins/shelf`, or
 there. Everything specific to one herdr session -- `archive/` (one folder per
 archived tab), `activity.json`, and the sweep schedule -- lives under
 `sessions/<name>/`, one subdirectory per herdr session listed in `sessions`
-(`sessions/default/` for the default session). State from before Shelf had an
-allowlist is moved into `sessions/default/` automatically the first time any
-command runs after upgrading.
+(`sessions/default/` for the default session).
+
+**Migrating from before the allowlist.** Versions before 0.3.0 kept
+`archive/`, `activity.json`, `last_sweep` and `installed_at` directly at the
+state root, shared by every herdr session that ran Shelf. On upgrading,
+those are moved into `sessions/default/` automatically -- merged in, never
+overwritten, and self-healing if a run is interrupted or a version is rolled
+back and used before upgrading again. Since every pre-0.3.0 session's
+archives land in the same `sessions/default/`, removing `"default"` from
+`sessions` hides all of them (they are still on disk, just not listed or
+restorable until `"default"` is back in `sessions`). To roll back to a
+version before 0.3.0, move the contents of `sessions/default/` back up to
+the state root before installing the older version, since it only looks
+there.
 
 Config: the directory printed by `herdr plugin config-dir shelf`, shared by
 every herdr session.

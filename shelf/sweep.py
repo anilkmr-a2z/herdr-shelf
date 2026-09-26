@@ -283,7 +283,8 @@ def _notify(client, report: dict) -> None:
         log.warning("notification failed: %s", e)
 
 
-def run(client, cfg: dict, state_dir, table: dict, if_due: bool = False, now: datetime | None = None):
+def run(client, cfg: dict, state_dir, table: dict, if_due: bool = False, now: datetime | None = None,
+       herdr_session: str = "default"):
     """One sweep. Returns the report, or None when not due or another sweep is running."""
     now = now or utc_now()
     state = Path(state_dir)
@@ -303,7 +304,7 @@ def run(client, cfg: dict, state_dir, table: dict, if_due: bool = False, now: da
         report = {"mode": cfg["mode"], "eligible": [], "archived": [], "failed": [], "skipped": []}
         gathered = []
         try:
-            _sweep(client, cfg, state, table, now, report, gathered)
+            _sweep(client, cfg, state, table, now, report, gathered, herdr_session)
             return report
         finally:
             # Notify with whatever the report holds -- even a partial one --
@@ -319,7 +320,8 @@ def run(client, cfg: dict, state_dir, table: dict, if_due: bool = False, now: da
         lock.__exit__(None, None, None)
 
 
-def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime, report: dict, gathered: list) -> None:
+def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime, report: dict, gathered: list,
+          herdr_session: str = "default") -> None:
     """Mutate report in place. Appends to gathered once the initial gather succeeds."""
     tabs = gather(client)
     gathered.append(True)
@@ -362,7 +364,7 @@ def _sweep(client, cfg: dict, state: Path, table: dict, now: datetime, report: d
                 _skip(report, label, reason)
                 continue
             archive_id = archive.archive_tab(client, arch, tab, panes, table, activity_of,
-                                             cfg["keep_transcripts"], now)
+                                             cfg["keep_transcripts"], now, herdr_session)
         except archive.Skip as e:
             _skip(report, label, str(e))
         except Exception as e:
@@ -397,7 +399,8 @@ def _warn_if_open_elsewhere(tab_id: str, panes: list, open_in: dict) -> None:
             log.warning("%s: conversation %s is also open in another tab", tab_id, session["value"][:8])
 
 
-def archive_now(client, cfg: dict, state_dir, table: dict, tab_id: str, now: datetime | None = None) -> str:
+def archive_now(client, cfg: dict, state_dir, table: dict, tab_id: str, now: datetime | None = None,
+                herdr_session: str = "default") -> str:
     """Archive one tab immediately, ignoring idle_days and mode."""
     now = now or utc_now()
     state = Path(state_dir)
@@ -416,4 +419,4 @@ def archive_now(client, cfg: dict, state_dir, table: dict, tab_id: str, now: dat
             raise archive.Skip(reason)
         _warn_if_open_elsewhere(tab_id, panes, _open_sessions(tabs))
         return archive.archive_tab(client, archive.Archive(state), tab, panes, table, activity_of,
-                                   cfg["keep_transcripts"], now)
+                                   cfg["keep_transcripts"], now, herdr_session)

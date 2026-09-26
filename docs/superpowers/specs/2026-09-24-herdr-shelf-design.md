@@ -302,7 +302,8 @@ A few rules make stripping and relaunching safe against surprising saved argvs:
 | `shelf/restore.py` | Rebuild an archived tab and resume its agents | `api`, `agents`, `archive`, `activity` |
 | `shelf/picker.py` | Popup UI listing archived tabs | `archive`, `restore` |
 | `shelf/session.py` | `herdr_session_name`: recover the herdr session name from `HERDR_SOCKET_PATH` | none |
-| `shelf/__main__.py` | Command-line entry: `track`, `sweep [--if-due]`, `archive <tab-id>`, `open-picker`, `pick`, `list`, `restore <id>`; gates every command on the session allowlist and computes each session's own state directory | all of the above |
+| `shelf/migrate.py` | Self-healing, one-way merge of pre-0.3.0 root-level state into `sessions/default/` | state directory |
+| `shelf/__main__.py` | Command-line entry: `track`, `sweep [--if-due]`, `archive <tab-id>`, `open-picker`, `pick`, `list`, `restore <id>`; gates every command on the session allowlist, computes each session's own state directory, and runs the migration | all of the above |
 
 Supporting a new agent needs one row in the agent table (or a config override).
 A history source for it is optional.
@@ -417,34 +418,61 @@ its own agents in a separate herdr session): archiving one of that session's
 tabs would take it away from the tool managing it, out from under it.
 
 `shelf/session.py`'s `herdr_session_name(socket_path)` recovers the session
-name from `HERDR_SOCKET_PATH` alone: the `<name>` in a path ending
-`/sessions/<name>/herdr.sock` (trailing slashes tolerated), or `"default"` for
-anything else, including a missing socket path (used by `list`, which is the
-only command that runs without `HERDR_SOCKET_PATH` at all -- see Command line
-in the README).
+name from `HERDR_SOCKET_PATH` alone. The path is normalized
+(`os.path.normpath`) first, so `..` components and doubled separators resolve
+the way a real filesystem path would, before any name is extracted from it.
+It returns:
+
+- the `<name>` in a normalized path ending `sessions/<name>/herdr.sock`, when
+  `<name>` passes herdr's own session name rule (letters, digits, `.`, `_` or
+  `-`, 1-64 characters, and not exactly `.` or `..`);
+- `"default"` for anything that does not name a session at all, including a
+  missing or empty socket path (used by `list`, the only command that runs
+  without `HERDR_SOCKET_PATH` at all -- see Command line in the README);
+- `None` -- a disabled session, never `"default"` -- when the path clearly
+  names a session (it has a `sessions` component in the normalized path) but
+  no valid name could be parsed there: a missing name, a name containing a
+  path separator, or a name that fails the rule above. `None` is always
+  treated as disabled by `__main__`, regardless of `sessions` in config.json
+  (including `"*"`): with no reliable name, there is nothing to safely
+  enable.
 
 `config.session_enabled(cfg, name)` is `"*" in cfg["sessions"] or name in
-cfg["sessions"]`. `__main__` computes the session name once per invocation and
-gates every command on it:
+cfg["sessions"]`. `config.sessions_for_gate(config_dir)` reads just the
+`sessions` key for the gate check below, without raising or logging: if
+`sessions` on its own is a valid non-empty list of non-empty strings, it is
+used as-is even when some other key in config.json is invalid (a hook still
+needs to know which session it may act in even when, say, `idle_days` is
+broken); otherwise (a missing file, malformed JSON, a non-object top level, a
+missing `sessions` key, or an invalid `sessions` value) it returns the
+default `["default"]`.
+
+`__main__` computes the session name once per invocation and gates every
+command on it:
 
 - The hooks (`track`, `sweep --if-due` -- which covers both the startup hook
   and the `workspace.focused` hook, since both run that same command -- and
   `open-picker`) return 0 immediately when the session is disabled, without
-  writing any state. `open-picker` additionally shows a notification, "shelf
-  is not enabled for herdr session `<name>`", instead of opening the popup.
+  writing any state. `open-picker`, and the manual `sweep` (the `sweep-now`
+  action), additionally show a notification, "shelf is not enabled for herdr
+  session `<name>`", instead of opening the popup or sweeping.
 - The manual commands (`sweep`, `archive`, `list`, `restore`, `pick`) print
   `shelf is not enabled for herdr session '<name>'; add it to "sessions" in
   config.json` and exit 1 when the session is disabled; `pick` instead shows
   that same message in the popup and waits for Enter, like its other error
-  paths.
-- The gate check itself loads config with `warn=False` (see Configuration),
-  so the "ignoring unknown key(s)" warning does not fire on every hook
-  invocation. When config.json is invalid, the check falls back to the
-  default `["default"]` sessions list rather than failing the gate outright;
-  a command that goes on to load config the normal way (with warnings) still
-  raises `ConfigError` and, for a hook, still triggers the existing
-  rate-limited "config.json is invalid" notification exactly as before this
-  check existed.
+  paths, and exits 0 either way -- it is a popup pane's command, not a script
+  whose exit code anything checks.
+- The gate check itself (`config.sessions_for_gate`, above) never raises and
+  never logs, so the "ignoring unknown key(s)" warning does not fire on every
+  hook invocation, and an invalid config.json cannot make the gate check
+  itself fail. A command that goes on to load config the normal way (with
+  warnings) still raises `ConfigError` and, for a hook, still triggers the
+  existing rate-limited "config.json is invalid" notification exactly as
+  before this check existed.
+- Migration (see State directory layout) runs before this gate, for every
+  invocation regardless of session: it is a shared, root-level concern, not
+  tied to any one session's allowlist, so it also runs -- and logs to the
+  shared `shelf.log` -- from a disabled session's hooks.
 
 ## State directory layout
 
@@ -481,15 +509,59 @@ and `config-error.lock` stay at the state root, shared across sessions, since
 they are not about any one session's tabs.
 
 **Migration.** Before this layout existed, `activity.json`, `archive/`,
-`last_sweep` and `installed_at` lived directly at the state root. The first
-time any command runs after upgrading, `__main__._migrate_to_sessions` checks
-whether `sessions/` exists yet; if not, it takes `migrate.lock` and, if any of
-those four still sit at the root, moves them into `sessions/default/` and logs
-one info line naming what moved. A fresh install (nothing at the root) leaves
-no trace: `sessions/` itself is created lazily by whichever component first
-needs a per-session file, not by this check. Running it again is a no-op,
-since `sessions/` exists by then; the lock file is left behind, like every
-other lock file this plugin uses.
+`last_sweep` and `installed_at` lived directly at the state root, shared by
+every herdr session that ran Shelf -- so a pre-0.3.0 archive can have come
+from any herdr session, and all of them land in `sessions/default/`
+regardless. `shelf/migrate.py`'s `merge_into_default_session(root)` runs on
+*every* invocation, called from `main()` before the session gate and before
+dispatch (so it runs for a disabled session too, logging to the shared
+`shelf.log`) -- never once ever. The presence of `sessions/` is never treated
+as "already migrated": a downgrade to a pre-0.3.0 build can write new
+root-level state after an earlier merge (a rollback), and a merge interrupted
+partway through must finish on a later run. Instead:
+
+1. `root_legacy_present(root)` is a cheap, lock-free check: do any of
+   `activity.json`, a non-empty `archive/`, `last_sweep` or `installed_at`
+   still exist directly at the root? If not, `merge_into_default_session`
+   returns immediately -- no lock taken, nothing created. This is what makes
+   a fresh install, or an invocation from a herdr session with nothing of its
+   own to migrate, free of side effects.
+2. Otherwise it takes `migrate.lock`, plus the root-level `sweep.lock` and
+   `activity.lock` -- the ones a still-running pre-0.3.0 process uses -- each
+   waiting up to 10 seconds, so a pre-0.3.0 process mid-sweep or mid-`track`
+   (for example right after a rollback) is excluded for the whole merge. A
+   lock that cannot be acquired in time is logged as a warning and left for
+   the next invocation to retry; it never raises.
+3. Each of the four items is merged independently, never overwriting a
+   destination that already exists:
+   - `archive/<id>`: moved into `sessions/default/archive/<id>` unless that
+     id already exists there, in which case the root copy is left in place
+     with a logged warning (archive ids are validated on save, so they
+     cannot be renamed to something like `<id>.migrated-<ts>` without
+     breaking that validation; leaving it is the safe choice).
+   - `activity.json`: moved as-is if the destination doesn't exist yet;
+     otherwise merged session by session -- for each session key, whichever
+     side has the later `last_active`, `restored_at` and `agent_started_at`
+     wins, field by field, with every other field defaulting to the
+     destination's; `"terminals"` is a union, keyed by terminal id, with the
+     same later-wins rule per entry.
+   - `last_sweep`: the destination wins whenever it already exists.
+   - `installed_at`: the earlier of the two wins whenever both exist -- the
+     plugin's install time should not appear to move later just because a
+     session was migrated.
+4. Whatever was actually moved is logged as one info line
+   (`"migrated legacy state into sessions/default: <items>"`). If anything
+   is still left at the root once the attempt is done (an archive id
+   collision, or a failure logged along the way), that is logged as an
+   error, but `merge_into_default_session` still returns normally: the
+   command that triggered it always gets to run, and the next invocation
+   retries whatever is left.
+
+Concurrent callers (two commands firing at once, for example a hook and a
+manual command) are serialized by the three locks above: the second one to
+acquire them finds the first one's work already done (or already failed and
+logged), and its own merge functions are no-ops for anything no longer at
+the root, so nothing is duplicated or lost either way.
 
 `last_status` (per session, alongside `first_seen`/`last_active`/`restored_at`) is
 the last `agent_status` recorded for that session, used to tell a real status
@@ -545,9 +617,15 @@ rewriting the file on every status flip.
       "last_activity": "2026-09-15T08:02:11Z"
     }
   },
-  "session_copies": ["projects/-home-user-src-api-service/<session-id>.jsonl"]
+  "session_copies": ["projects/-home-user-src-api-service/<session-id>.jsonl"],
+  "herdr_session": "default"
 }
 ```
+
+`herdr_session` is informational only: the herdr session (see Herdr session
+allowlist above) the tab was archived from, for a human reading the record
+later. It is not consulted for anything -- restoring an archive does not
+check or require the current session to match it.
 
 `layout.root` is the tree returned by `layout.export`, stored as is. Records are
 written to a temporary file and renamed into place.
@@ -560,16 +638,22 @@ not removed.
 
 ## Flows
 
-Every flow below is gated on the herdr session allowlist (see Herdr session
-allowlist above): `__main__` computes the herdr session name from
-`HERDR_SOCKET_PATH` and checks it against `sessions` before doing any of the
-work described in that flow. The one exception is `sweep --if-due`'s own due
-check (step 1 below), which runs before the gate rather than after it, so a
-hook invocation that is not due skips both without ever loading config. A
-disabled session short-circuits its flow at that gate -- a hook returns 0
-without going any further, and a manual command prints (or, for `pick`, shows
-in the popup) that the session is not enabled and exits 1 -- so nothing past
-that point runs and no state is written.
+Migration (see State directory layout) runs first, ahead of every flow below
+and regardless of the session gate. Every flow below is then gated on the
+herdr session allowlist (see Herdr session allowlist above): `__main__`
+computes the herdr session name from `HERDR_SOCKET_PATH` and checks it
+against `sessions` before doing any of the work described in that flow. The
+one exception is `sweep --if-due`'s own due check (step 1 below), which runs
+before the gate rather than after it, so a hook invocation that is not due
+skips both without ever loading config. A disabled session short-circuits
+its flow at that gate -- a hook returns 0 without going any further
+(`open-picker` and the manual `sweep` also show a notification first), and a
+manual command prints (or, for `pick`, shows in the popup) that the session
+is not enabled -- so nothing past that point runs and no state is written.
+Exit codes on a disabled session follow each command's own convention:
+1 for `sweep`, `archive`, `list` and `restore`; 0 for a hook; and 0 for
+`pick`, which is a popup pane's command, not a script whose exit code
+anything checks.
 
 ### Track (`track`, on `pane.agent_status_changed` or `pane.agent_detected`)
 

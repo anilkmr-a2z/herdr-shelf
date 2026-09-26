@@ -68,6 +68,13 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(record["session_copies"], ["projects/-src-api/S1.jsonl", "projects/-src-api/S1"])
         self.assertEqual(len(files), 2)
         self.assertTrue(record["id"].startswith("20260924T120000Z-"))
+        self.assertEqual(record["herdr_session"], "default")
+
+    def test_record_contents_carries_the_given_herdr_session(self):
+        fake = fake_herdr(self)
+        record, _ = archive.capture(Client(fake.path), TAB, PANES, self.table, self.activity_of, True, T0,
+                                    herdr_session="cao")
+        self.assertEqual(record["herdr_session"], "cao")
 
     def test_last_activity_uses_the_terminal_start_when_more_recent(self):
         # w1:p3's terminal_id is "term_a"; a real activity_of (built the same
@@ -227,9 +234,11 @@ class ArchiveTabTest(unittest.TestCase):
             return {"type": "ok"}
 
         fake.handlers["tab.close"] = close
-        archive_id = archive.archive_tab(Client(fake.path), self.arch, TAB, PANES, self.table, self.activity_of, True, T0)
+        archive_id = archive.archive_tab(Client(fake.path), self.arch, TAB, PANES, self.table, self.activity_of, True, T0,
+                                         herdr_session="cao")
         self.assertEqual(seen["records_at_close"], 1)
         self.assertEqual(self.arch.load(archive_id)["tab"]["label"], "fix-retries")
+        self.assertEqual(self.arch.load(archive_id)["herdr_session"], "cao")
         self.assertEqual(fake.methods()[-1], "tab.close")
 
     def test_worktree_group_skips_and_cleans_up(self):

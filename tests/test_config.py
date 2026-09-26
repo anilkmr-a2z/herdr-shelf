@@ -180,5 +180,67 @@ class SessionEnabledTest(unittest.TestCase):
         self.assertFalse(config.session_enabled(cfg, "cao"))
 
 
+class SessionsForGateTest(unittest.TestCase):
+    """A best-effort, never-raising, never-logging read of just the
+    "sessions" key, used for the per-session allowlist gate: a valid
+    "sessions" value is honored even when the rest of config.json is
+    invalid, since a hook must still be able to tell which session it's
+    allowed to act in."""
+
+    def write(self, d, obj):
+        text = obj if isinstance(obj, str) else json.dumps(obj)
+        (Path(d) / "config.json").write_text(text)
+
+    def test_no_config_dir_or_file_uses_the_default(self):
+        self.assertEqual(config.sessions_for_gate(None), ["default"])
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(config.sessions_for_gate(d), ["default"])
+
+    def test_valid_sessions_is_used_even_when_another_key_is_invalid(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"idle_days": -1, "sessions": ["cao"]})
+            self.assertEqual(config.sessions_for_gate(d), ["cao"])
+
+    def test_star_is_used_even_when_another_key_is_invalid(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"mode": "yes", "sessions": ["*"]})
+            self.assertEqual(config.sessions_for_gate(d), ["*"])
+
+    def test_invalid_sessions_value_falls_back_to_the_default(self):
+        bad = [[], "default", [""], [1], None, {"default": True}]
+        for value in bad:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as d:
+                self.write(d, {"sessions": value})
+                self.assertEqual(config.sessions_for_gate(d), ["default"])
+
+    def test_missing_sessions_key_falls_back_to_the_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"idle_days": 3})
+            self.assertEqual(config.sessions_for_gate(d), ["default"])
+
+    def test_malformed_json_falls_back_to_the_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, "{not json")
+            self.assertEqual(config.sessions_for_gate(d), ["default"])
+
+    def test_non_object_top_level_falls_back_to_the_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, [1, 2])
+            self.assertEqual(config.sessions_for_gate(d), ["default"])
+
+    def test_never_logs_a_warning(self):
+        handler = _CapturingHandler()
+        log = logging.getLogger("shelf")
+        log.addHandler(handler)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.write(d, {"colour": "blue", "idle_days": -1, "sessions": ["cao"]})
+                result = config.sessions_for_gate(d)
+        finally:
+            log.removeHandler(handler)
+        self.assertEqual(result, ["cao"])
+        self.assertEqual(handler.records, [])
+
+
 if __name__ == "__main__":
     unittest.main()

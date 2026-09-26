@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import activity, agents, archive, config, picker, restore, session, sweep
+from . import activity, agents, archive, config, migrate, picker, restore, session, sweep
 from .api import Client, HerdrError
 from .util import FileLock, LockBusy, now
 
@@ -19,10 +19,10 @@ USAGE = ("usage: python3 -m shelf {track | sweep [--if-due] | archive <tab-id> |
 FMT = logging.Formatter("%(asctime)s %(levelname)s [%(session)s] %(message)s")
 CONFIG_ERROR_NOTIFY_INTERVAL_SECONDS = 3600
 
-# Pre-0.3.0 files that used to live directly under the plugin's state root,
-# one per herdr session now. Migrated once into sessions/default/ -- see
-# _migrate_to_sessions.
-_LEGACY_SESSION_FILES = ("activity.json", "archive", "last_sweep", "installed_at")
+# Displayed (in log lines and messages) in place of the herdr session name
+# when session.herdr_session_name could not parse one at all -- see
+# _session_name. Such a session is always disabled; this is display-only.
+_UNKNOWN_SESSION_DISPLAY = "unknown"
 
 log = logging.getLogger("shelf")
 
@@ -63,60 +63,43 @@ def _config_dir() -> Path:
     return Path(base) / "herdr" / "plugins" / "config" / PLUGIN_ID
 
 
-def _session_name() -> str:
+def _session_name():
+    """The herdr session this invocation runs in, or None when
+    HERDR_SOCKET_PATH clearly names a session but no valid name could be
+    parsed from it -- see shelf.session.herdr_session_name. None is always
+    treated as disabled, regardless of "sessions" in config.json (including
+    "*"): with no reliable name, there is nothing to safely enable.
+    """
     return session.herdr_session_name(os.environ.get("HERDR_SOCKET_PATH"))
+
+
+def _display_session_name(session_name) -> str:
+    return session_name if session_name is not None else _UNKNOWN_SESSION_DISPLAY
 
 
 def _session_dir(root: Path, session_name: str) -> Path:
     return root / "sessions" / session_name
 
 
-def _migrate_to_sessions(root: Path) -> None:
-    """One-time move of pre-0.3.0 root-level state into sessions/default/.
-
-    Before per-session state, activity.json, archive/, last_sweep and
-    installed_at lived directly under the plugin's state root. If
-    "sessions" doesn't exist yet and any of those do, they are moved into
-    sessions/default/ under a root lock, so two processes racing on the
-    first post-upgrade invocation do not both try it. A fresh install (none
-    of those files exist) leaves no trace: "sessions" is created lazily by
-    whichever component needs it, not by this check, so a fresh install
-    never gets an empty "sessions" directory from this alone.
-    """
-    sessions_dir = root / "sessions"
-    if sessions_dir.exists():
-        return
-    with FileLock(root / "migrate.lock"):
-        if sessions_dir.exists():
-            return
-        found = [name for name in _LEGACY_SESSION_FILES if (root / name).exists()]
-        if not found:
-            return
-        default_dir = sessions_dir / "default"
-        default_dir.mkdir(parents=True, exist_ok=True)
-        for name in found:
-            os.replace(str(root / name), str(default_dir / name))
-        log.info("migrated legacy state into sessions/default: %s", ", ".join(found))
+def _session_allowed(session_name, config_dir) -> bool:
+    if session_name is None:
+        return False
+    sessions = config.sessions_for_gate(config_dir)
+    return config.session_enabled({"sessions": sessions}, session_name)
 
 
-def _gate_config(config_dir) -> dict:
-    """Config for the per-session allowlist check, loaded quietly.
-
-    Loaded with warn=False so the "ignoring unknown key(s)" warning does not
-    fire on every hook invocation. An invalid config.json falls back to the
-    default sessions list for this check alone; a command that goes on to
-    load config the normal way still raises ConfigError -- and, for a hook,
-    still notifies through the usual rate-limited path -- exactly as before
-    this check existed.
-    """
-    try:
-        return config.load(config_dir, warn=False)
-    except config.ConfigError:
-        return config.DEFAULTS
-
-
-def _disabled_message(name: str) -> str:
+def _disabled_message(session_name) -> str:
+    name = _display_session_name(session_name)
     return f"shelf is not enabled for herdr session '{name}'; add it to \"sessions\" in config.json"
+
+
+def _notify_disabled(client, session_name) -> None:
+    try:
+        client.call("notification.show",
+                    {"title": "shelf", "body": f"shelf is not enabled for herdr session "
+                                                f"{_display_session_name(session_name)}"})
+    except HerdrError as e:
+        log.warning("notification failed: %s", e)
 
 
 def _rotate_if_large(path: Path) -> None:
@@ -201,9 +184,11 @@ def main(argv=None) -> int:
     session_name = _session_name()
     is_hook = _is_hook(command, args)
     try:
-        _setup_logging(state, session_name)
-        _migrate_to_sessions(state)
-        return _dispatch(command, args, state)
+        _setup_logging(state, _display_session_name(session_name))
+        # Runs for every session, including a disabled one: it is a shared,
+        # root-level concern, independent of any one session's allowlist.
+        migrate.merge_into_default_session(state)
+        return _dispatch(command, args, state, session_name)
     except config.ConfigError as e:
         log.error("%s: %s", command or "shelf", e)
         if is_hook or command == "sweep":
@@ -253,7 +238,14 @@ def _pick(state: Path) -> int:
             except HerdrError as e:
                 log.warning("notification failed: %s", e)
 
-        picker.run(arch, do_restore, now, notify=notify)
+        # input_fn and print_fn are passed explicitly (rather than relying
+        # on picker.run's own defaults) so a test's mock.patch("builtins.
+        # input"/"builtins.print") actually takes effect: a default
+        # parameter value is bound once when picker.py is first imported,
+        # long before any test patches builtins.input, so picker.run's own
+        # default would keep calling the original, real input() no matter
+        # what is patched later.
+        picker.run(arch, do_restore, now, input_fn=input, print_fn=print, notify=notify)
     except (EOFError, KeyboardInterrupt):
         pass
     except Exception as e:
@@ -266,7 +258,7 @@ def _pick(state: Path) -> int:
     return 0
 
 
-def _pick_disabled(session_name: str) -> int:
+def _pick_disabled(session_name) -> int:
     print(_disabled_message(session_name), file=sys.stderr)
     try:
         input("Press Enter to close. ")
@@ -275,14 +267,18 @@ def _pick_disabled(session_name: str) -> int:
     return 0
 
 
-def _dispatch(command: str, args: list, state: Path) -> int:
-    session_name = _session_name()
-    session_state = _session_dir(state, session_name)
+def _dispatch(command: str, args: list, state: Path, session_name) -> int:
+    # session_state is None exactly when session_name is None (an
+    # unparseable HERDR_SOCKET_PATH): allowed() is always False then, and no
+    # branch below reads session_state without going through allowed()
+    # first, other than sweep's own due-check, which is itself guarded on
+    # session_state being set.
+    session_state = _session_dir(state, session_name) if session_name is not None else None
     _allowed = {}
 
     def allowed() -> bool:
         if "v" not in _allowed:
-            _allowed["v"] = config.session_enabled(_gate_config(_config_dir()), session_name)
+            _allowed["v"] = _session_allowed(session_name, _config_dir())
         return _allowed["v"]
 
     if command == "track":
@@ -293,7 +289,8 @@ def _dispatch(command: str, args: list, state: Path) -> int:
         return 0
     if command == "sweep":
         if_due = "--if-due" in args
-        if if_due and not sweep.is_due(session_state, config.DEFAULTS["sweep_interval_minutes"], now()):
+        if if_due and session_state is not None \
+                and not sweep.is_due(session_state, config.DEFAULTS["sweep_interval_minutes"], now()):
             # Checked before config is even loaded, using the default
             # interval: config.load's own "unknown key(s)" warning must not
             # fire on every hook invocation (startup, every focus change)
@@ -303,11 +300,22 @@ def _dispatch(command: str, args: list, state: Path) -> int:
         if not allowed():
             if if_due:
                 return 0
+            # The printed message is the guaranteed signal for a manual
+            # sweep run from a terminal; the notification (like
+            # open-picker's) is a best-effort addition for the sweep-now
+            # action, triggered from herdr's UI rather than a terminal, so a
+            # missing or unreachable HERDR_SOCKET_PATH must never keep the
+            # message itself from being printed.
             print(_disabled_message(session_name), file=sys.stderr)
+            try:
+                _notify_disabled(Client(), session_name)
+            except HerdrError:
+                pass
             return 1
         cfg = config.load(_config_dir())
         client = Client()
-        report = sweep.run(client, cfg, session_state, agents.table(cfg["agents"]), if_due=if_due)
+        report = sweep.run(client, cfg, session_state, agents.table(cfg["agents"]), if_due=if_due,
+                           herdr_session=session_name)
         if report is None:
             # For a manual sweep (no --if-due), run() returning None can only
             # mean the lock was busy: the due check itself is only consulted
@@ -327,11 +335,7 @@ def _dispatch(command: str, args: list, state: Path) -> int:
     if command == "open-picker":
         client = Client()
         if not allowed():
-            try:
-                client.call("notification.show",
-                            {"title": "shelf", "body": f"shelf is not enabled for herdr session {session_name}"})
-            except HerdrError as e:
-                log.warning("notification failed: %s", e)
+            _notify_disabled(client, session_name)
             return 0
         try:
             client.call("plugin.pane.open", {"plugin_id": os.environ.get("HERDR_PLUGIN_ID") or PLUGIN_ID,
@@ -366,7 +370,7 @@ def _dispatch(command: str, args: list, state: Path) -> int:
             return 1
         cfg = config.load(_config_dir())
         table = agents.table(cfg["agents"])
-        print(sweep.archive_now(Client(), cfg, session_state, table, args[0]))
+        print(sweep.archive_now(Client(), cfg, session_state, table, args[0], herdr_session=session_name))
         return 0
     if command == "restore":
         if not allowed():

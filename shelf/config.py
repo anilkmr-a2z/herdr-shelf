@@ -99,11 +99,40 @@ def _validate(cfg: dict, path: Path, warn: bool = True) -> None:
     _validate_sessions(cfg, path)
 
 
+def _is_valid_sessions_value(sessions) -> bool:
+    return isinstance(sessions, list) and bool(sessions) and all(isinstance(s, str) and s for s in sessions)
+
+
 def _validate_sessions(cfg: dict, path: Path) -> None:
-    sessions = cfg["sessions"]
-    if not isinstance(sessions, list) or not sessions \
-            or not all(isinstance(s, str) and s for s in sessions):
+    if not _is_valid_sessions_value(cfg["sessions"]):
         raise ConfigError(f"{path}: sessions must be a non-empty list of non-empty strings")
+
+
+def sessions_for_gate(config_dir) -> list:
+    """The "sessions" list to use for the per-session allowlist gate alone.
+
+    Never raises and never logs, for a caller (the gate check in __main__)
+    that runs on every hook invocation and must not flood shelf.log, and
+    must still have an answer even when config.json is otherwise broken.
+    If "sessions" on its own is a valid non-empty list of non-empty strings,
+    it is used as-is, regardless of any other invalid value elsewhere in
+    the file -- a hook still needs to know which session it may act in even
+    when, say, idle_days is broken. Otherwise (a missing file, malformed
+    JSON, a non-object top level, a missing "sessions" key, or an invalid
+    "sessions" value) the default sessions list is used.
+    """
+    default = list(DEFAULTS["sessions"])
+    if not config_dir:
+        return default
+    path = Path(config_dir) / "config.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return default
+    if not isinstance(raw, dict) or "sessions" not in raw:
+        return default
+    sessions = raw["sessions"]
+    return sessions if _is_valid_sessions_value(sessions) else default
 
 
 def _is_str_list(value) -> bool:
