@@ -120,6 +120,7 @@ sweep); there is nothing to reload.
   "mode": "dry-run",
   "sweep_interval_minutes": 60,
   "keep_transcripts": true,
+  "sessions": ["default"],
   "agents": {
     "qwen": {"relaunch": "plain"},
     "myagent": {"program": "myagent", "resume": ["--load", "{id}"], "strip": ["-l"]}
@@ -129,6 +130,7 @@ sweep); there is nothing to reload.
 
 - `mode`: `dry-run` reports only; `live` archives.
 - `keep_transcripts`: keep copies of Claude conversation files in the archive.
+- `sessions`: which herdr sessions Shelf acts in. See "Herdr sessions" below.
 - `agents.<name>.program`: executable to look for and to run.
 - `agents.<name>.resume`: resume arguments; `{id}` becomes the session id.
 - `agents.<name>.strip` / `strip_bare`: flags (with or without a value) removed
@@ -139,6 +141,34 @@ sweep); there is nothing to reload.
 - `agents.<name>.relaunch`: `"plain"` runs `<program> <resume args>` instead of
   the saved command line. Use it for an agent you start with a prompt argument,
   such as `claude "fix the build"`, or the prompt would be sent again.
+
+## Herdr sessions
+
+herdr plugins are installed once per machine, and every herdr session's server
+loads them -- the default session, and any named session, each with its own
+socket (the default session's is `herdr.sock` in herdr's config directory; a
+named session `<name>`'s is `sessions/<name>/herdr.sock`). Shelf's plugin
+state and config are shared across sessions, keyed only by its plugin id, so
+without an allowlist Shelf would sweep every herdr session on the machine.
+
+`sessions` in `config.json` is the allowlist: a non-empty list of session
+names Shelf is allowed to act in. It defaults to `["default"]`, so Shelf
+only ever touches the default session unless you add more. `"*"` allows
+every session. A session not in the list gets no hooks, no sweeps, and no
+manual command: `track`, `sweep --if-due` and the startup sweep return
+immediately without writing anything; `open-picker` shows a notification
+saying so instead of opening the popup; and the manual `sweep`, `archive`,
+`list`, `restore` and `pick` commands print (or, for `pick`, show in the
+popup) that the session is not enabled and exit 1.
+
+Add a named session to `sessions` if you want Shelf to manage tabs there too.
+Leave out any session whose agents are managed by another tool -- for
+example a session a separate automation tool runs its own agents in --
+since archiving one of its tabs would take that tab away from the tool
+managing it, out from under it.
+
+Each herdr session keeps its own archive, activity history and sweep
+schedule; see "Where things live" below.
 
 ## Command line
 
@@ -170,11 +200,17 @@ commands.
 ## Where things live
 
 State: `$XDG_STATE_HOME/herdr/plugins/shelf`, or
-`~/.local/state/herdr/plugins/shelf` when `XDG_STATE_HOME` is not
-set. It holds `archive/` (one folder per archived tab), `activity.json`, and
-`shelf.log`.
+`~/.local/state/herdr/plugins/shelf` when `XDG_STATE_HOME` is not set.
+`shelf.log` (the durable log, rotated to `shelf.log.1` past 1MB) lives directly
+there. Everything specific to one herdr session -- `archive/` (one folder per
+archived tab), `activity.json`, and the sweep schedule -- lives under
+`sessions/<name>/`, one subdirectory per herdr session listed in `sessions`
+(`sessions/default/` for the default session). State from before Shelf had an
+allowlist is moved into `sessions/default/` automatically the first time any
+command runs after upgrading.
 
-Config: the directory printed by `herdr plugin config-dir shelf`.
+Config: the directory printed by `herdr plugin config-dir shelf`, shared by
+every herdr session.
 
 ## Uninstall
 

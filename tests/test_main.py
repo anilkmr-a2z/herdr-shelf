@@ -37,6 +37,12 @@ class MainTest(unittest.TestCase):
         # dir is removed so later tests (in this or other modules) sharing
         # the same logger name do not try to write to a deleted directory.
         self.addCleanup(self._reset_shelf_logger)
+        # Per-session state (archive/, activity.json, last_sweep,
+        # installed_at, sweep.lock) lives under sessions/<name>/; with no
+        # HERDR_SOCKET_PATH set, that name is "default". shelf.log,
+        # config-error-notified and config-error.lock stay at the root
+        # (self.tmp.name).
+        self.session = Path(self.tmp.name) / "sessions" / "default"
 
     @staticmethod
     def _reset_shelf_logger():
@@ -44,6 +50,7 @@ class MainTest(unittest.TestCase):
         for handler in shelf_log.handlers:
             handler.close()
         shelf_log.handlers = []
+        shelf_log.filters = []
 
     def test_developer_home_config_is_never_read(self):
         # A config.json sitting under a "real-looking" ~/.config path (as it
@@ -91,7 +98,8 @@ class MainTest(unittest.TestCase):
         # per the default 60-minute interval: config.load must never even be
         # called, so its "unknown key(s)" warning cannot flood shelf.log on
         # every focus-change hook between actual sweeps.
-        (Path(self.tmp.name) / "last_sweep").write_text(iso(now()) + "\n")
+        (self.session / "last_sweep").parent.mkdir(parents=True, exist_ok=True)
+        (self.session / "last_sweep").write_text(iso(now()) + "\n")
         with mock.patch("shelf.__main__.config.load") as load, redirect_stderr(io.StringIO()):
             self.assertEqual(main(["sweep", "--if-due"]), 0)
         load.assert_not_called()
@@ -121,7 +129,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("No archived tabs.", out.getvalue())
 
     def test_list_shows_one_record_without_a_picker_number(self):
-        archive_dir = Path(self.tmp.name) / "archive" / "20260101T000000Z-abcdef"
+        archive_dir = self.session / "archive" / "20260101T000000Z-abcdef"
         archive_dir.mkdir(parents=True)
         (archive_dir / "record.json").write_text(json.dumps({
             "id": "20260101T000000Z-abcdef", "archived_at": "2026-01-01T00:00:00Z",
@@ -156,7 +164,7 @@ class MainTest(unittest.TestCase):
             self.assertIn("python3 -m shelf list", err.getvalue())
 
     def test_restore_other_keyerrors_are_not_mistaken_for_a_missing_entry(self):
-        archive_dir = Path(self.tmp.name) / "archive" / "20260101T000000Z-abcdef"
+        archive_dir = self.session / "archive" / "20260101T000000Z-abcdef"
         archive_dir.mkdir(parents=True)
         (archive_dir / "record.json").write_text(json.dumps({
             "id": "20260101T000000Z-abcdef", "archived_at": "2026-01-01T00:00:00Z",
@@ -175,7 +183,7 @@ class MainTest(unittest.TestCase):
         os.makedirs(home, exist_ok=True)
         with mock.patch.dict(os.environ, {"HOME": home, "XDG_STATE_HOME": xdg_state}):
             state_dir = Path(xdg_state) / "herdr" / "plugins" / "shelf"
-            archive_dir = state_dir / "archive" / "20260101T000000Z-abcdef"
+            archive_dir = state_dir / "sessions" / "default" / "archive" / "20260101T000000Z-abcdef"
             archive_dir.mkdir(parents=True)
             (archive_dir / "record.json").write_text(json.dumps({
                 "id": "20260101T000000Z-abcdef", "archived_at": "2026-01-01T00:00:00Z",
@@ -296,7 +304,7 @@ class MainTest(unittest.TestCase):
         self.addCleanup(fake.close)
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}), \
                 mock.patch("shelf.sweep.ARCHIVE_NOW_LOCK_WAIT_SECONDS", 0.1):
-            with FileLock(Path(self.tmp.name) / "sweep.lock"):
+            with FileLock(self.session / "sweep.lock"):
                 err = io.StringIO()
                 with redirect_stderr(err):
                     code = main(["archive", "w1:t1"])
@@ -305,7 +313,7 @@ class MainTest(unittest.TestCase):
             self.assertNotIn("sweep.lock", err.getvalue())
 
     def test_restore_lock_busy_prints_friendly_message_not_the_lock_path(self):
-        archive_dir = Path(self.tmp.name) / "archive" / "20260101T000000Z-abcdef"
+        archive_dir = self.session / "archive" / "20260101T000000Z-abcdef"
         archive_dir.mkdir(parents=True)
         (archive_dir / "record.json").write_text(json.dumps({
             "id": "20260101T000000Z-abcdef", "archived_at": "2026-01-01T00:00:00Z",
@@ -313,7 +321,7 @@ class MainTest(unittest.TestCase):
         }))
         with mock.patch("shelf.restore.RESTORE_LOCK_WAIT_SECONDS", 0.1), \
                 mock.patch("shelf.__main__.Client"):
-            with FileLock(Path(self.tmp.name) / "sweep.lock"):
+            with FileLock(self.session / "sweep.lock"):
                 err = io.StringIO()
                 with redirect_stderr(err):
                     code = main(["restore", "20260101T000000Z-abcdef"])
@@ -325,7 +333,7 @@ class MainTest(unittest.TestCase):
         fake = FakeHerdr()
         self.addCleanup(fake.close)
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}):
-            with FileLock(Path(self.tmp.name) / "sweep.lock"):
+            with FileLock(self.session / "sweep.lock"):
                 out, err = io.StringIO(), io.StringIO()
                 with redirect_stdout(out), redirect_stderr(err):
                     code = main(["sweep"])
@@ -336,7 +344,7 @@ class MainTest(unittest.TestCase):
         fake = FakeHerdr()
         self.addCleanup(fake.close)
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}):
-            with FileLock(Path(self.tmp.name) / "sweep.lock"):
+            with FileLock(self.session / "sweep.lock"):
                 out, err = io.StringIO(), io.StringIO()
                 with redirect_stdout(out), redirect_stderr(err):
                     code = main(["sweep", "--if-due"])
@@ -358,6 +366,258 @@ class MainTest(unittest.TestCase):
         self.assertIn(("notification.show",
                        {"title": "shelf", "body": "shelf: close the open popup or dialog first"}),
                       fake.calls)
+
+
+class SessionAllowlistTest(unittest.TestCase):
+    """Shelf must only act in herdr sessions the user lists (default: only
+    "default"), and keep separate state per herdr session."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(os.environ, {
+            "HERDR_PLUGIN_STATE_DIR": self.tmp.name,
+            "XDG_CONFIG_HOME": os.path.join(self.tmp.name, "xdg-config"),
+            "XDG_STATE_HOME": os.path.join(self.tmp.name, "xdg-state"),
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HERDR_SOCKET_PATH", None)
+        os.environ.pop("HERDR_PLUGIN_CONFIG_DIR", None)
+        self.addCleanup(MainTest._reset_shelf_logger)
+        self.root = Path(self.tmp.name)
+        self.default_session = self.root / "sessions" / "default"
+        self.cao_session = self.root / "sessions" / "cao"
+
+    def use_cao_socket(self):
+        """A HERDR_SOCKET_PATH whose session name parses as "cao", with no
+        real socket file -- fine for any path where Shelf must not even try
+        to reach herdr (a disabled hook, or a disabled manual command)."""
+        path = os.path.join(self.tmp.name, "herdr-config", "sessions", "cao", "herdr.sock")
+        mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}).start()
+        self.addCleanup(lambda: os.environ.pop("HERDR_SOCKET_PATH", None))
+        return path
+
+    def use_cao_socket_linked_to(self, fake):
+        """Like use_cao_socket, but the path is a real, reachable socket (a
+        symlink to fake's own socket file), for a check that must actually
+        call herdr (e.g. open-picker's disabled notification)."""
+        link = Path(self.tmp.name) / "herdr-config" / "sessions" / "cao" / "herdr.sock"
+        link.parent.mkdir(parents=True)
+        os.symlink(fake.path, link)
+        mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": str(link)}).start()
+        self.addCleanup(lambda: os.environ.pop("HERDR_SOCKET_PATH", None))
+        return str(link)
+
+    def write_config(self, obj):
+        config_dir = os.path.join(self.tmp.name, "config")
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as f:
+            json.dump(obj, f)
+        mock.patch.dict(os.environ, {"HERDR_PLUGIN_CONFIG_DIR": config_dir}).start()
+        self.addCleanup(lambda: os.environ.pop("HERDR_PLUGIN_CONFIG_DIR", None))
+
+    # -- Hooks: a disabled session returns 0 immediately and writes nothing. --
+
+    def test_disabled_hook_track_writes_no_state(self):
+        self.use_cao_socket()
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["track"]), 0)
+        self.assertFalse(self.cao_session.exists())
+
+    def test_disabled_hook_sweep_if_due_writes_no_state(self):
+        self.use_cao_socket()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["sweep", "--if-due"]), 0)
+        self.assertFalse(self.cao_session.exists())
+
+    def test_disabled_hook_startup_sweep_writes_no_state(self):
+        # The startup hook runs the exact same command as the
+        # workspace.focused hook: "sweep --if-due".
+        self.use_cao_socket()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["sweep", "--if-due"]), 0)
+        self.assertFalse((self.cao_session / "last_sweep").exists())
+
+    def test_enabled_hook_sweep_if_due_is_unaffected(self):
+        # The default session is enabled by default, so its own hooks are
+        # unaffected by another session being disabled.
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        fake.handlers.update({"tab.list": lambda p: {"tabs": []}, "pane.list": lambda p: {"panes": []}})
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": fake.path}):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["sweep", "--if-due"]), 0)
+        self.assertTrue((self.default_session / "last_sweep").exists())
+
+    def test_disabled_open_picker_shows_a_notification_instead_of_opening(self):
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        fake.handlers["notification.show"] = lambda p: {"type": "ok"}
+        self.use_cao_socket_linked_to(fake)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["open-picker"]), 0)
+        self.assertNotIn("plugin.pane.open", fake.methods())
+        self.assertIn(("notification.show", {"title": "shelf", "body": "shelf is not enabled for herdr session cao"}),
+                      fake.calls)
+
+    # -- Manual commands: a disabled session prints a message and exits 1. --
+
+    def test_disabled_manual_sweep_prints_message_and_exits_one(self):
+        self.use_cao_socket()
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = main(["sweep"])
+        self.assertEqual(code, 1)
+        self.assertIn("shelf is not enabled for herdr session 'cao'", err.getvalue())
+        self.assertIn('add it to "sessions" in config.json', err.getvalue())
+
+    def test_disabled_manual_archive_prints_message_and_exits_one(self):
+        self.use_cao_socket()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(["archive", "w1:t1"])
+        self.assertEqual(code, 1)
+        self.assertIn("shelf is not enabled for herdr session 'cao'", err.getvalue())
+
+    def test_disabled_list_prints_message_and_exits_one(self):
+        self.use_cao_socket()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(["list"])
+        self.assertEqual(code, 1)
+        self.assertIn("shelf is not enabled for herdr session 'cao'", err.getvalue())
+
+    def test_disabled_restore_prints_message_and_exits_one(self):
+        self.use_cao_socket()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(["restore", "20260101T000000Z-abcdef"])
+        self.assertEqual(code, 1)
+        self.assertIn("shelf is not enabled for herdr session 'cao'", err.getvalue())
+
+    def test_disabled_pick_shows_message_in_the_popup_and_waits_for_enter(self):
+        self.use_cao_socket()
+        err = io.StringIO()
+        with mock.patch("builtins.input", return_value="") as input_mock, redirect_stderr(err):
+            code = main(["pick"])
+        self.assertEqual(code, 0)
+        self.assertIn("shelf is not enabled for herdr session 'cao'", err.getvalue())
+        input_mock.assert_called_once_with("Press Enter to close. ")
+
+    def test_list_with_no_socket_path_uses_the_default_session(self):
+        # Configuring only "cao" leaves "default" (used when
+        # HERDR_SOCKET_PATH is unset) disabled.
+        self.write_config({"sessions": ["cao"]})
+        os.environ.pop("HERDR_SOCKET_PATH", None)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(["list"])
+        self.assertEqual(code, 1)
+        self.assertIn("shelf is not enabled for herdr session 'default'", err.getvalue())
+
+    # -- A named session, once allowed, works exactly like "default". --
+
+    def test_named_session_can_be_allowed_and_gets_its_own_state(self):
+        self.write_config({"sessions": ["default", "cao"], "mode": "live"})
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        fake.handlers.update({"tab.list": lambda p: {"tabs": []}, "pane.list": lambda p: {"panes": []}})
+        self.use_cao_socket_linked_to(fake)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["sweep", "--if-due"]), 0)
+        self.assertTrue((self.cao_session / "last_sweep").exists())
+        self.assertFalse((self.default_session / "last_sweep").exists())
+
+    def test_star_allows_every_session(self):
+        self.write_config({"sessions": ["*"]})
+        self.use_cao_socket()
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = main(["list"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("not enabled", err.getvalue())
+
+    # -- Logging includes the herdr session name. --
+
+    def test_log_line_includes_the_herdr_session_name(self):
+        self.write_config({"sessions": ["cao"]})
+        self.use_cao_socket()
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["open-picker"]), 0)
+        log_text = (self.root / "shelf.log").read_text()
+        self.assertIn("[cao]", log_text)
+
+    def test_log_line_includes_the_default_session_name(self):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["pick"]), 0)
+        log_text = (self.root / "shelf.log").read_text()
+        self.assertIn("[default]", log_text)
+
+
+class MigrationTest(unittest.TestCase):
+    """The one-time move of pre-0.3.0 root-level state into sessions/default/."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(os.environ, {
+            "HERDR_PLUGIN_STATE_DIR": self.tmp.name,
+            "XDG_CONFIG_HOME": os.path.join(self.tmp.name, "xdg-config"),
+            "XDG_STATE_HOME": os.path.join(self.tmp.name, "xdg-state"),
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HERDR_SOCKET_PATH", None)
+        os.environ.pop("HERDR_PLUGIN_CONFIG_DIR", None)
+        self.addCleanup(MainTest._reset_shelf_logger)
+        self.root = Path(self.tmp.name)
+
+    def write_legacy_state(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "activity.json").write_text('{"claude:S": {"first_seen": "2026-09-01T00:00:00Z"}}')
+        archive_dir = self.root / "archive" / "20260101T000000Z-abcdef"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "record.json").write_text(json.dumps({
+            "id": "20260101T000000Z-abcdef", "archived_at": "2026-01-01T00:00:00Z",
+            "tab": {"label": "demo"}, "workspace": {"label": None}, "panes": {},
+        }))
+        (self.root / "last_sweep").write_text("2026-09-01T00:00:00Z\n")
+        (self.root / "installed_at").write_text("2026-08-01T00:00:00Z\n")
+
+    def test_migration_moves_legacy_files_into_sessions_default(self):
+        self.write_legacy_state()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(main(["list"]), 0)
+        self.assertIn("20260101T000000Z-abcdef  demo", out.getvalue())
+        default_session = self.root / "sessions" / "default"
+        self.assertTrue((default_session / "activity.json").exists())
+        self.assertTrue((default_session / "archive" / "20260101T000000Z-abcdef" / "record.json").exists())
+        self.assertTrue((default_session / "last_sweep").exists())
+        self.assertTrue((default_session / "installed_at").exists())
+        self.assertFalse((self.root / "activity.json").exists())
+        self.assertFalse((self.root / "archive").exists())
+        self.assertFalse((self.root / "last_sweep").exists())
+        self.assertFalse((self.root / "installed_at").exists())
+        log_text = (self.root / "shelf.log").read_text()
+        self.assertEqual(log_text.count("migrated legacy state"), 1)
+
+    def test_migration_is_a_noop_the_second_time(self):
+        self.write_legacy_state()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["list"]), 0)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["list"]), 0)
+        log_text = (self.root / "shelf.log").read_text()
+        self.assertEqual(log_text.count("migrated legacy state"), 1)
+
+    def test_fresh_install_creates_no_sessions_directory(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(main(["list"]), 0)
+        self.assertIn("No archived tabs.", out.getvalue())
+        self.assertFalse((self.root / "sessions").exists())
 
 
 if __name__ == "__main__":

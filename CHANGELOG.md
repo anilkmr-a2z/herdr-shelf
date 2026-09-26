@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.0 - unreleased
+
+- Add a herdr-session allowlist: a new `"sessions"` config key (default
+  `["default"]`, `"*"` for every session) controls which herdr sessions
+  Shelf acts in. Each herdr session (the default one, and any named session
+  under `sessions/<name>`) has its own socket, but plugin state and config
+  are shared across all of them, keyed only by plugin id; without this,
+  Shelf would sweep every herdr session on the machine, including one
+  driven by another tool (for example an automation session whose agents
+  are managed elsewhere, where archiving a tab would take it away from that
+  tool). **Behavior change:** before this release Shelf swept every herdr
+  session; from this release it sweeps only the `default` session unless
+  `sessions` is configured otherwise. A herdr session not in `sessions`
+  gets no hooks, no sweeps, and no manual command: `track`, `sweep
+  --if-due`, and the startup sweep return immediately and write nothing;
+  `open-picker` shows a notification instead of opening the popup; the
+  manual `sweep`, `archive`, `list`, `restore` and `pick` commands print
+  (or, for `pick`, show in the popup) that the session is not enabled and
+  exit 1.
+- State is now kept separately per herdr session, under
+  `sessions/<name>/` in the plugin's state directory (`archive/`,
+  `activity.json`, `activity.lock`, `last_sweep`, `sweep.lock`,
+  `installed_at`); `shelf.log`, `shelf.log.1`, `config-error-notified` and
+  `config-error.lock` stay at the state directory's root. Existing state
+  from before this release is moved into `sessions/default/` automatically,
+  once, the first time any command runs after upgrading.
+- `shelf.log` lines now include the herdr session name, for example
+  `... INFO [default] archived old`.
+
 ## 0.2.1 - 2026-09-25
 
 - Fix: starting or resuming an agent in a pane now counts as activity (a new

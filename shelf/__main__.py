@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import activity, agents, archive, config, picker, restore, sweep
+from . import activity, agents, archive, config, picker, restore, session, sweep
 from .api import Client, HerdrError
 from .util import FileLock, LockBusy, now
 
@@ -16,9 +16,27 @@ PLUGIN_ID = "shelf"
 ALWAYS_HOOKS = ("track", "open-picker")
 USAGE = ("usage: python3 -m shelf {track | sweep [--if-due] | archive <tab-id> | open-picker | pick | "
          "list | restore <archive-id>}")
-FMT = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+FMT = logging.Formatter("%(asctime)s %(levelname)s [%(session)s] %(message)s")
 CONFIG_ERROR_NOTIFY_INTERVAL_SECONDS = 3600
+
+# Pre-0.3.0 files that used to live directly under the plugin's state root,
+# one per herdr session now. Migrated once into sessions/default/ -- see
+# _migrate_to_sessions.
+_LEGACY_SESSION_FILES = ("activity.json", "archive", "last_sweep", "installed_at")
+
 log = logging.getLogger("shelf")
+
+
+class _SessionFilter(logging.Filter):
+    """Attaches the herdr session name to every log record, for FMT's %(session)s."""
+
+    def __init__(self, session_name: str):
+        super().__init__()
+        self.session_name = session_name
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.session = self.session_name
+        return True
 
 
 def _is_hook(command: str, args: list) -> bool:
@@ -45,6 +63,62 @@ def _config_dir() -> Path:
     return Path(base) / "herdr" / "plugins" / "config" / PLUGIN_ID
 
 
+def _session_name() -> str:
+    return session.herdr_session_name(os.environ.get("HERDR_SOCKET_PATH"))
+
+
+def _session_dir(root: Path, session_name: str) -> Path:
+    return root / "sessions" / session_name
+
+
+def _migrate_to_sessions(root: Path) -> None:
+    """One-time move of pre-0.3.0 root-level state into sessions/default/.
+
+    Before per-session state, activity.json, archive/, last_sweep and
+    installed_at lived directly under the plugin's state root. If
+    "sessions" doesn't exist yet and any of those do, they are moved into
+    sessions/default/ under a root lock, so two processes racing on the
+    first post-upgrade invocation do not both try it. A fresh install (none
+    of those files exist) leaves no trace: "sessions" is created lazily by
+    whichever component needs it, not by this check, so a fresh install
+    never gets an empty "sessions" directory from this alone.
+    """
+    sessions_dir = root / "sessions"
+    if sessions_dir.exists():
+        return
+    with FileLock(root / "migrate.lock"):
+        if sessions_dir.exists():
+            return
+        found = [name for name in _LEGACY_SESSION_FILES if (root / name).exists()]
+        if not found:
+            return
+        default_dir = sessions_dir / "default"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        for name in found:
+            os.replace(str(root / name), str(default_dir / name))
+        log.info("migrated legacy state into sessions/default: %s", ", ".join(found))
+
+
+def _gate_config(config_dir) -> dict:
+    """Config for the per-session allowlist check, loaded quietly.
+
+    Loaded with warn=False so the "ignoring unknown key(s)" warning does not
+    fire on every hook invocation. An invalid config.json falls back to the
+    default sessions list for this check alone; a command that goes on to
+    load config the normal way still raises ConfigError -- and, for a hook,
+    still notifies through the usual rate-limited path -- exactly as before
+    this check existed.
+    """
+    try:
+        return config.load(config_dir, warn=False)
+    except config.ConfigError:
+        return config.DEFAULTS
+
+
+def _disabled_message(name: str) -> str:
+    return f"shelf is not enabled for herdr session '{name}'; add it to \"sessions\" in config.json"
+
+
 def _rotate_if_large(path: Path) -> None:
     try:
         if path.exists() and path.stat().st_size > 1_000_000:
@@ -53,7 +127,7 @@ def _rotate_if_large(path: Path) -> None:
         pass
 
 
-def _setup_logging(state: Path) -> None:
+def _setup_logging(state: Path, session_name: str) -> None:
     handlers = []
     try:
         state.mkdir(parents=True, exist_ok=True)
@@ -70,6 +144,7 @@ def _setup_logging(state: Path) -> None:
     for old in log.handlers:
         old.close()
     log.handlers[:] = handlers
+    log.filters[:] = [_SessionFilter(session_name)]
     log.setLevel(logging.INFO)
     log.propagate = False
 
@@ -123,9 +198,11 @@ def main(argv=None) -> int:
     command = argv[0] if argv else ""
     args = argv[1:]
     state = _state_dir()
+    session_name = _session_name()
     is_hook = _is_hook(command, args)
     try:
-        _setup_logging(state)
+        _setup_logging(state, session_name)
+        _migrate_to_sessions(state)
         return _dispatch(command, args, state)
     except config.ConfigError as e:
         log.error("%s: %s", command or "shelf", e)
@@ -189,23 +266,48 @@ def _pick(state: Path) -> int:
     return 0
 
 
+def _pick_disabled(session_name: str) -> int:
+    print(_disabled_message(session_name), file=sys.stderr)
+    try:
+        input("Press Enter to close. ")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return 0
+
+
 def _dispatch(command: str, args: list, state: Path) -> int:
+    session_name = _session_name()
+    session_state = _session_dir(state, session_name)
+    _allowed = {}
+
+    def allowed() -> bool:
+        if "v" not in _allowed:
+            _allowed["v"] = config.session_enabled(_gate_config(_config_dir()), session_name)
+        return _allowed["v"]
+
     if command == "track":
-        activity.track(Client(), activity.ActivityStore(state), os.environ.get("HERDR_PLUGIN_EVENT_JSON"),
+        if not allowed():
+            return 0
+        activity.track(Client(), activity.ActivityStore(session_state), os.environ.get("HERDR_PLUGIN_EVENT_JSON"),
                        os.environ.get("HERDR_PANE_ID"), now(), os.environ.get("HERDR_PLUGIN_EVENT"))
         return 0
     if command == "sweep":
         if_due = "--if-due" in args
-        if if_due and not sweep.is_due(state, config.DEFAULTS["sweep_interval_minutes"], now()):
+        if if_due and not sweep.is_due(session_state, config.DEFAULTS["sweep_interval_minutes"], now()):
             # Checked before config is even loaded, using the default
             # interval: config.load's own "unknown key(s)" warning must not
             # fire on every hook invocation (startup, every focus change)
             # when a sweep is not due anyway. sweep.run() re-checks with the
             # real configured interval once it does load config below.
             return 0
+        if not allowed():
+            if if_due:
+                return 0
+            print(_disabled_message(session_name), file=sys.stderr)
+            return 1
         cfg = config.load(_config_dir())
         client = Client()
-        report = sweep.run(client, cfg, state, agents.table(cfg["agents"]), if_due=if_due)
+        report = sweep.run(client, cfg, session_state, agents.table(cfg["agents"]), if_due=if_due)
         if report is None:
             # For a manual sweep (no --if-due), run() returning None can only
             # mean the lock was busy: the due check itself is only consulted
@@ -224,6 +326,13 @@ def _dispatch(command: str, args: list, state: Path) -> int:
         return 0
     if command == "open-picker":
         client = Client()
+        if not allowed():
+            try:
+                client.call("notification.show",
+                            {"title": "shelf", "body": f"shelf is not enabled for herdr session {session_name}"})
+            except HerdrError as e:
+                log.warning("notification failed: %s", e)
+            return 0
         try:
             client.call("plugin.pane.open", {"plugin_id": os.environ.get("HERDR_PLUGIN_ID") or PLUGIN_ID,
                                               "entrypoint": "picker"})
@@ -241,7 +350,10 @@ def _dispatch(command: str, args: list, state: Path) -> int:
         print(USAGE, file=sys.stderr)
         return 2
     if command == "list":
-        arch = archive.Archive(state)
+        if not allowed():
+            print(_disabled_message(session_name), file=sys.stderr)
+            return 1
+        arch = archive.Archive(session_state)
         records = arch.list()
         if not records:
             print("No archived tabs.")
@@ -249,12 +361,18 @@ def _dispatch(command: str, args: list, state: Path) -> int:
             print(f"{rec['id']}  {_describe(rec, now())}")
         return 0
     if command == "archive":
+        if not allowed():
+            print(_disabled_message(session_name), file=sys.stderr)
+            return 1
         cfg = config.load(_config_dir())
         table = agents.table(cfg["agents"])
-        print(sweep.archive_now(Client(), cfg, state, table, args[0]))
+        print(sweep.archive_now(Client(), cfg, session_state, table, args[0]))
         return 0
     if command == "restore":
-        arch = archive.Archive(state)
+        if not allowed():
+            print(_disabled_message(session_name), file=sys.stderr)
+            return 1
+        arch = archive.Archive(session_state)
         try:
             arch.load(args[0])  # existence check only; any other error follows the normal path
         except KeyError:
@@ -262,14 +380,16 @@ def _dispatch(command: str, args: list, state: Path) -> int:
             return 1
         cfg = config.load(_config_dir())
         table = agents.table(cfg["agents"])
-        store = activity.ActivityStore(state)
+        store = activity.ActivityStore(session_state)
         result = restore.restore(Client(), arch, store, args[0], table, now())
         for warning in result["warnings"]:
             print(warning)
         print(result["tab_id"] or "")
         return 0
     if command == "pick":
-        return _pick(state)
+        if not allowed():
+            return _pick_disabled(session_name)
+        return _pick(session_state)
     print(USAGE, file=sys.stderr)
     return 2
 

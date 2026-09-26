@@ -16,7 +16,11 @@ DEFAULTS = {
     "sweep_interval_minutes": 60,
     "keep_transcripts": True,
     "agents": {},
+    "sessions": ["default"],
 }
+
+# The value that allows every herdr session, rather than naming each one.
+ALL_SESSIONS = "*"
 
 MAX_IDLE_DAYS = 3650
 MAX_SWEEP_INTERVAL_MINUTES = 10080
@@ -32,7 +36,14 @@ def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def load(config_dir) -> dict:
+def load(config_dir, warn: bool = True) -> dict:
+    """Load config.json, applying defaults for missing keys.
+
+    warn=False suppresses the "ignoring unknown key(s)" log warnings (top
+    level and per-agent), for a caller that loads config on every event (for
+    example the per-session allowlist check) and must not flood shelf.log.
+    Invalid values still raise ConfigError either way.
+    """
     cfg = copy.deepcopy(DEFAULTS)
     if not config_dir:
         return cfg
@@ -46,16 +57,26 @@ def load(config_dir) -> dict:
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: the top level must be an object")
     unknown = sorted(set(raw) - set(DEFAULTS))
-    if unknown:
+    if unknown and warn:
         log.warning("%s: ignoring unknown key(s): %s", path, ", ".join(unknown))
     for key in DEFAULTS:
         if key in raw:
             cfg[key] = raw[key]
-    _validate(cfg, path)
+    _validate(cfg, path, warn)
     return cfg
 
 
-def _validate(cfg: dict, path: Path) -> None:
+def session_enabled(cfg: dict, name: str) -> bool:
+    """Whether Shelf should act in the herdr session called name.
+
+    cfg["sessions"] defaults to ["default"]; "*" in the list allows every
+    session.
+    """
+    sessions = cfg.get("sessions") or DEFAULTS["sessions"]
+    return ALL_SESSIONS in sessions or name in sessions
+
+
+def _validate(cfg: dict, path: Path, warn: bool = True) -> None:
     idle_days = cfg["idle_days"]
     if not _is_number(idle_days) or not math.isfinite(idle_days) or idle_days <= 0:
         raise ConfigError(f"{path}: idle_days must be a positive number")
@@ -74,16 +95,24 @@ def _validate(cfg: dict, path: Path) -> None:
     if not isinstance(agents, dict) or not all(isinstance(v, dict) for v in agents.values()):
         raise ConfigError(f"{path}: agents must map agent names to objects")
     for name, entry in agents.items():
-        _validate_agent(name, entry, path)
+        _validate_agent(name, entry, path, warn)
+    _validate_sessions(cfg, path)
+
+
+def _validate_sessions(cfg: dict, path: Path) -> None:
+    sessions = cfg["sessions"]
+    if not isinstance(sessions, list) or not sessions \
+            or not all(isinstance(s, str) and s for s in sessions):
+        raise ConfigError(f"{path}: sessions must be a non-empty list of non-empty strings")
 
 
 def _is_str_list(value) -> bool:
     return isinstance(value, list) and all(isinstance(v, str) for v in value)
 
 
-def _validate_agent(name: str, entry: dict, path: Path) -> None:
+def _validate_agent(name: str, entry: dict, path: Path, warn: bool = True) -> None:
     unknown = sorted(set(entry) - AGENT_KEYS)
-    if unknown:
+    if unknown and warn:
         log.warning("%s: agents.%s: ignoring unknown key(s): %s", path, name, ", ".join(unknown))
     if "program" in entry and not (isinstance(entry["program"], str) and entry["program"]):
         raise ConfigError(f"{path}: agents.{name}.program must be a non-empty string")

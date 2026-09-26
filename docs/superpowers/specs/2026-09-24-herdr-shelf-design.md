@@ -301,7 +301,8 @@ A few rules make stripping and relaunching safe against surprising saved argvs:
 | `shelf/archive.py` | Create, list, load and delete archive records; copy Claude session files in and out | state directory |
 | `shelf/restore.py` | Rebuild an archived tab and resume its agents | `api`, `agents`, `archive`, `activity` |
 | `shelf/picker.py` | Popup UI listing archived tabs | `archive`, `restore` |
-| `shelf/__main__.py` | Command-line entry: `track`, `sweep [--if-due]`, `archive <tab-id>`, `open-picker`, `pick`, `list`, `restore <id>` | all of the above |
+| `shelf/session.py` | `herdr_session_name`: recover the herdr session name from `HERDR_SOCKET_PATH` | none |
+| `shelf/__main__.py` | Command-line entry: `track`, `sweep [--if-due]`, `archive <tab-id>`, `open-picker`, `pick`, `list`, `restore <id>`; gates every command on the session allowlist and computes each session's own state directory | all of the above |
 
 Supporting a new agent needs one row in the agent table (or a config override).
 A history source for it is optional.
@@ -379,6 +380,7 @@ nested. All keys are optional.
   "mode": "dry-run",
   "sweep_interval_minutes": 60,
   "keep_transcripts": true,
+  "sessions": ["default"],
   "agents": {
     "qwen": {"relaunch": "plain"},
     "myagent": {"program": "myagent", "resume": ["--load", "{id}"], "strip": ["-l"]}
@@ -389,6 +391,8 @@ nested. All keys are optional.
 - `mode`: `dry-run` reports only; `live` archives.
 - `keep_transcripts`: copy Claude session files into the archive, so a resume still
   works after Claude Code's `cleanupPeriodDays` (default 30) deletes the originals.
+- `sessions`: the herdr sessions Shelf is allowed to act in (see "Herdr session
+  allowlist" below). Defaults to `["default"]`; `"*"` allows every session.
 - `agents`: per-agent overrides merged over the built-in table. `strip` lists flags
   that take a value; flags without a value go in `strip_bare`.
 
@@ -396,28 +400,96 @@ An unknown top-level key, or an unknown key inside an `agents` entry, is logged 
 a warning and otherwise ignored; it does not fail config loading. A per-agent
 `resume` must be a non-empty list of strings containing `"{id}"` in at least one
 element (nothing to substitute the session id into, otherwise), and `program`, if
-given, must be a non-empty string. Either failing raises `ConfigError`, same as an
-invalid top-level value.
+given, must be a non-empty string. `sessions` must be a non-empty list of
+non-empty strings. Any of these failing raises `ConfigError`, same as an invalid
+top-level value.
+
+## Herdr session allowlist
+
+herdr plugins are installed once per machine, and every herdr session's server
+loads them. Each herdr session has its own socket -- the default session's is
+`<herdr config dir>/herdr.sock`; a named session `<name>`'s is
+`<herdr config dir>/sessions/<name>/herdr.sock` -- but a plugin's own state and
+config directories are shared across every session on the machine, keyed only
+by plugin id. Without an allowlist, Shelf would sweep every herdr session,
+including one driven by another tool (for example an automation tool that runs
+its own agents in a separate herdr session): archiving one of that session's
+tabs would take it away from the tool managing it, out from under it.
+
+`shelf/session.py`'s `herdr_session_name(socket_path)` recovers the session
+name from `HERDR_SOCKET_PATH` alone: the `<name>` in a path ending
+`/sessions/<name>/herdr.sock` (trailing slashes tolerated), or `"default"` for
+anything else, including a missing socket path (used by `list`, which is the
+only command that runs without `HERDR_SOCKET_PATH` at all -- see Command line
+in the README).
+
+`config.session_enabled(cfg, name)` is `"*" in cfg["sessions"] or name in
+cfg["sessions"]`. `__main__` computes the session name once per invocation and
+gates every command on it:
+
+- The hooks (`track`, `sweep --if-due` -- which covers both the startup hook
+  and the `workspace.focused` hook, since both run that same command -- and
+  `open-picker`) return 0 immediately when the session is disabled, without
+  writing any state. `open-picker` additionally shows a notification, "shelf
+  is not enabled for herdr session `<name>`", instead of opening the popup.
+- The manual commands (`sweep`, `archive`, `list`, `restore`, `pick`) print
+  `shelf is not enabled for herdr session '<name>'; add it to "sessions" in
+  config.json` and exit 1 when the session is disabled; `pick` instead shows
+  that same message in the popup and waits for Enter, like its other error
+  paths.
+- The gate check itself loads config with `warn=False` (see Configuration),
+  so the "ignoring unknown key(s)" warning does not fire on every hook
+  invocation. When config.json is invalid, the check falls back to the
+  default `["default"]` sessions list rather than failing the gate outright;
+  a command that goes on to load config the normal way (with warnings) still
+  raises `ConfigError` and, for a hook, still triggers the existing
+  rate-limited "config.json is invalid" notification exactly as before this
+  check existed.
 
 ## State directory layout
 
-Under `HERDR_PLUGIN_STATE_DIR`:
+Under `HERDR_PLUGIN_STATE_DIR` (the plugin state root, shared by every herdr
+session):
 
 ```
-activity.json                        {"<agent>:<session>": {"first_seen", "last_active", "restored_at",
+sessions/<name>/activity.json        {"<agent>:<session>": {"first_seen", "last_active", "restored_at",
                                                              "last_status", "agent_started_at"},
                                        "terminals": {"<terminal_id>": {"agent_started_at"}}}
-activity.lock                        held while activity.json is read and rewritten
-archive/<archive-id>/record.json
-archive/<archive-id>/sessions/...    copies of Claude session files and directories
-installed_at                         ISO time of the first sweep ever run
-last_sweep                           ISO time of the last completed sweep
-sweep.lock                           held for the duration of a sweep, a restore, or a picker delete
+sessions/<name>/activity.lock        held while activity.json is read and rewritten
+sessions/<name>/archive/<archive-id>/record.json
+sessions/<name>/archive/<archive-id>/sessions/...  copies of Claude session files and directories
+sessions/<name>/installed_at         ISO time of the first sweep ever run, for this herdr session
+sessions/<name>/last_sweep           ISO time of the last completed sweep, for this herdr session
+sessions/<name>/sweep.lock           held for the duration of a sweep, a restore, or a picker delete
+migrate.lock                         held while pre-0.3.0 root-level state is moved into sessions/default/
 config-error.lock                    held while a broken config.json is reported
 config-error-notified                mtime marks the last "config.json is invalid" notification
-shelf.log                            one line per decision or error
+shelf.log                            one line per decision or error, tagged with the herdr session name
 shelf.log.1                          shelf.log rotated out once it passes 1MB
 ```
+
+Everything under `sessions/<name>/` is private to one herdr session -- `<name>`
+being whatever `shelf/session.py`'s `herdr_session_name` recovers from that
+invocation's `HERDR_SOCKET_PATH` (see Herdr session allowlist above). `archive`,
+`activity`, `sweep` and `restore` all take that per-session directory as their
+"state directory" argument; `restore` and the picker's delete lock derive
+`sweep.lock`'s location from `Archive.root.parent`, so as long as every caller
+constructs `Archive` (and `ActivityStore`) with the per-session directory, all
+of a session's own files -- including the two lock files derived this way --
+land together automatically. `shelf.log`, `shelf.log.1`, `config-error-notified`
+and `config-error.lock` stay at the state root, shared across sessions, since
+they are not about any one session's tabs.
+
+**Migration.** Before this layout existed, `activity.json`, `archive/`,
+`last_sweep` and `installed_at` lived directly at the state root. The first
+time any command runs after upgrading, `__main__._migrate_to_sessions` checks
+whether `sessions/` exists yet; if not, it takes `migrate.lock` and, if any of
+those four still sit at the root, moves them into `sessions/default/` and logs
+one info line naming what moved. A fresh install (nothing at the root) leaves
+no trace: `sessions/` itself is created lazily by whichever component first
+needs a per-session file, not by this check. Running it again is a no-op,
+since `sessions/` exists by then; the lock file is left behind, like every
+other lock file this plugin uses.
 
 `last_status` (per session, alongside `first_seen`/`last_active`/`restored_at`) is
 the last `agent_status` recorded for that session, used to tell a real status
@@ -487,6 +559,17 @@ nothing to apply them to). They are kept in the record for a human reading it,
 not removed.
 
 ## Flows
+
+Every flow below is gated on the herdr session allowlist (see Herdr session
+allowlist above): `__main__` computes the herdr session name from
+`HERDR_SOCKET_PATH` and checks it against `sessions` before doing any of the
+work described in that flow. The one exception is `sweep --if-due`'s own due
+check (step 1 below), which runs before the gate rather than after it, so a
+hook invocation that is not due skips both without ever loading config. A
+disabled session short-circuits its flow at that gate -- a hook returns 0
+without going any further, and a manual command prints (or, for `pick`, shows
+in the popup) that the session is not enabled and exits 1 -- so nothing past
+that point runs and no state is written.
 
 ### Track (`track`, on `pane.agent_status_changed` or `pane.agent_detected`)
 

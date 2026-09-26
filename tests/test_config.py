@@ -1,9 +1,19 @@
 import json
+import logging
 import tempfile
 import unittest
 from pathlib import Path
 
 from shelf import config
+
+
+class _CapturingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
 
 
 class ConfigTest(unittest.TestCase):
@@ -85,6 +95,89 @@ class ConfigTest(unittest.TestCase):
             self.write(d, {"agents": {"x": {"program": "x", "resume": ["--load", "{id}"]}}})
             cfg = config.load(d)
         self.assertEqual(cfg["agents"]["x"]["resume"], ["--load", "{id}"])
+
+    def test_sessions_defaults_to_default_only(self):
+        self.assertEqual(config.load(None)["sessions"], ["default"])
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(config.load(d)["sessions"], ["default"])
+
+    def test_sessions_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"sessions": ["default", "work"]})
+            cfg = config.load(d)
+        self.assertEqual(cfg["sessions"], ["default", "work"])
+
+    def test_sessions_star_is_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"sessions": ["*"]})
+            cfg = config.load(d)
+        self.assertEqual(cfg["sessions"], ["*"])
+
+    def test_sessions_invalid_values(self):
+        bad_values = [
+            {"sessions": []},
+            {"sessions": "default"},
+            {"sessions": [""]},
+            {"sessions": [1]},
+            {"sessions": None},
+            {"sessions": {"default": True}},
+        ]
+        for bad in bad_values:
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as d:
+                self.write(d, bad)
+                with self.assertRaises(config.ConfigError):
+                    config.load(d)
+
+    def test_load_warn_false_suppresses_unknown_key_warning(self):
+        handler = _CapturingHandler()
+        log = logging.getLogger("shelf")
+        log.addHandler(handler)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.write(d, {"colour": "blue"})
+                cfg = config.load(d, warn=False)
+        finally:
+            log.removeHandler(handler)
+        self.assertNotIn("colour", cfg)
+        self.assertEqual(handler.records, [])
+
+    def test_load_warn_false_suppresses_unknown_agent_key_warning(self):
+        handler = _CapturingHandler()
+        log = logging.getLogger("shelf")
+        log.addHandler(handler)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.write(d, {"agents": {"qwen": {"relaunch": "plain", "nickname": "Q"}}})
+                cfg = config.load(d, warn=False)
+        finally:
+            log.removeHandler(handler)
+        self.assertEqual(cfg["agents"], {"qwen": {"relaunch": "plain", "nickname": "Q"}})
+        self.assertEqual(handler.records, [])
+
+    def test_load_warn_false_still_raises_on_invalid_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"idle_days": 0})
+            with self.assertRaises(config.ConfigError):
+                config.load(d, warn=False)
+
+
+class SessionEnabledTest(unittest.TestCase):
+    def test_default_session_enabled_by_default(self):
+        cfg = config.load(None)
+        self.assertTrue(config.session_enabled(cfg, "default"))
+        self.assertFalse(config.session_enabled(cfg, "cao"))
+
+    def test_star_enables_every_session(self):
+        cfg = {"sessions": ["*"]}
+        self.assertTrue(config.session_enabled(cfg, "default"))
+        self.assertTrue(config.session_enabled(cfg, "cao"))
+        self.assertTrue(config.session_enabled(cfg, "anything"))
+
+    def test_named_sessions_enable_only_those_listed(self):
+        cfg = {"sessions": ["default", "work"]}
+        self.assertTrue(config.session_enabled(cfg, "default"))
+        self.assertTrue(config.session_enabled(cfg, "work"))
+        self.assertFalse(config.session_enabled(cfg, "cao"))
 
 
 if __name__ == "__main__":
