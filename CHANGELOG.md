@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - unreleased
+## 0.3.0 - 2026-09-26
 
 - Add a herdr-session allowlist: a new `"sessions"` config key (default
   `["default"]`, `"*"` for every session) controls which herdr sessions
