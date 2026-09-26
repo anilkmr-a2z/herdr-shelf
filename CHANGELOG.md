@@ -14,7 +14,9 @@
   session; from this release it sweeps only the `default` session unless
   `sessions` is configured otherwise. A herdr session not in `sessions`
   gets no hooks, no sweeps, and no manual command: `track`, `sweep
-  --if-due`, and the startup sweep return immediately and write nothing;
+  --if-due`, and the startup sweep return immediately and write nothing of
+  their own (the one-time state migration below is a separate, shared
+  concern and may still run from any session's hook, disabled or not);
   `open-picker`, and the manual `sweep` (the `sweep-now` action), show a
   notification instead of opening the popup or sweeping; the manual
   `sweep`, `archive`, `list` and `restore` commands print that the session
@@ -34,7 +36,16 @@
   since it is a shared, one-time cleanup rather than a per-session
   concern; pre-0.3.0 archives from any herdr session all land in
   `sessions/default/`, so they are hidden if `"default"` is ever removed
-  from `sessions`.
+  from `sessions`. An archive id colliding with one already migrated is
+  moved aside to `archive.conflict/<id>` at the state root if it differs
+  from the destination, or simply dropped if the two are byte-identical.
+  If the migration cannot fully clear `activity.json`, `installed_at` or
+  `last_sweep` from the root (for example an older version is still
+  running and holds the locks it needs), `sweep` and `archive` refuse
+  rather than act on what could be an incomplete activity history --
+  hooks skip silently, the manual commands print `shelf: migrating state
+  from an older version; try again in a moment` and exit 1; `list` keeps
+  working throughout.
 - `shelf.log` lines now include the herdr session name, for example
   `... INFO [default] archived old`.
 - New archive records carry an informational `"herdr_session"` field

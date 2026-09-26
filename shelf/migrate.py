@@ -16,8 +16,10 @@ to do.
 
 from __future__ import annotations
 
+import filecmp
 import logging
 import os
+import shutil
 from pathlib import Path
 
 from .util import FileLock, LockBusy, atomic_write_json, parse_iso, read_json
@@ -91,6 +93,44 @@ def _merge(root: Path) -> None:
                   "(see warnings above); will retry on the next command")
 
 
+def _archive_entries_identical(a: Path, b: Path) -> bool:
+    """Whether two archive folders (record.json plus any copied session
+    files under sessions/) are byte-identical, file for file."""
+    files_a = sorted(p.relative_to(a).as_posix() for p in a.rglob("*") if p.is_file())
+    files_b = sorted(p.relative_to(b).as_posix() for p in b.rglob("*") if p.is_file())
+    if files_a != files_b:
+        return False
+    return all(filecmp.cmp(str(a / rel), str(b / rel), shallow=False) for rel in files_a)
+
+
+def _resolve_archive_collision(root: Path, entry: Path, dest: Path) -> bool:
+    """entry (root/archive/<id>) collides with dest (sessions/default/
+    archive/<id>), which is never overwritten. If the two are identical,
+    the root copy is simply redundant and is deleted. Otherwise it is a
+    genuine conflict: moved to root/archive.conflict/<id> (outside
+    archive/, so root_legacy_present no longer sees it, and this does not
+    warn again on a later invocation) and logged once. Returns whether the
+    collision was actually resolved (false in the rare case where
+    archive.conflict/<id> itself already exists too, in which case the
+    root copy is left in place, unresolved, exactly as before this
+    function existed).
+    """
+    if _archive_entries_identical(entry, dest):
+        shutil.rmtree(entry)
+        return True
+    conflict_dir = root / "archive.conflict"
+    conflict_dest = conflict_dir / entry.name
+    if conflict_dest.exists():
+        log.warning("archive %s already has a conflicting copy at archive.conflict/%s; "
+                    "leaving the root copy in place", entry.name, entry.name)
+        return False
+    conflict_dir.mkdir(parents=True, exist_ok=True)
+    os.replace(str(entry), str(conflict_dest))
+    log.warning("archive %s exists at both the root and in sessions/default, and differs; "
+                "moved the root copy to archive.conflict/%s", entry.name, entry.name)
+    return True
+
+
 def _merge_archive(root: Path, default_dir: Path) -> bool:
     src_root = root / "archive"
     if not src_root.is_dir():
@@ -100,8 +140,11 @@ def _merge_archive(root: Path, default_dir: Path) -> bool:
     for entry in sorted(src_root.iterdir()):
         dest = dest_root / entry.name
         if dest.exists():
-            log.warning("archive %s exists at both the root and in sessions/default; "
-                        "leaving the root copy in place", entry.name)
+            try:
+                if _resolve_archive_collision(root, entry, dest):
+                    moved_any = True
+            except OSError:
+                log.exception("failed to resolve archive %s collision during migration", entry.name)
             continue
         try:
             dest_root.mkdir(parents=True, exist_ok=True)
@@ -119,15 +162,26 @@ def _merge_archive(root: Path, default_dir: Path) -> bool:
 
 
 def _merge_activity_json(root: Path, default_dir: Path) -> bool:
+    """Merge root activity.json into sessions/default/activity.json.
+
+    Takes sessions/default/activity.lock -- the same lock
+    activity.ActivityStore uses -- for the read-merge-write of the
+    destination, so a concurrent ActivityStore.update() for this session
+    (for example from a track hook running at the same time) is properly
+    serialized with this merge rather than racing it: whichever actually
+    runs first, the other sees its result and neither write is lost.
+    """
     src = root / "activity.json"
     if not src.exists():
         return False
     dest = default_dir / "activity.json"
-    if not dest.exists():
-        os.replace(str(src), str(dest))
-        return True
-    merged = _merge_activity_data(read_json(dest, {}), read_json(src, {}))
-    atomic_write_json(dest, merged)
+    default_dir.mkdir(parents=True, exist_ok=True)
+    with FileLock(default_dir / "activity.lock", wait_seconds=LOCK_WAIT_SECONDS):
+        if not dest.exists():
+            os.replace(str(src), str(dest))
+            return True
+        merged = _merge_activity_data(read_json(dest, {}), read_json(src, {}))
+        atomic_write_json(dest, merged)
     src.unlink()
     return True
 

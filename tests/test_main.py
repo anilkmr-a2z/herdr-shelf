@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +14,12 @@ from shelf.__main__ import main
 from shelf.api import HerdrError
 from shelf.util import FileLock, iso, now
 from tests.fakeherdr import FakeError, FakeHerdr
+
+# A fixed instant for tests that need main()'s internal now() to match an
+# assertion made afterward: calling the real now() twice (once inside
+# main(), once in the test) is flaky whenever the two calls straddle a
+# second boundary, since iso() truncates to whole seconds.
+FIXED_NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _restorable_record(archive_id: str, session_value: str = "S1") -> dict:
@@ -613,11 +620,11 @@ class SessionAllowlistTest(unittest.TestCase):
         self.assertNotIn("not enabled", err.getvalue())
 
     def test_unparseable_session_path_is_always_disabled_even_with_star(self):
-        # A socket path that clearly names a session but has no name
-        # between "sessions" and "herdr.sock" resolves to None, which must
-        # never be enabled -- not even by "*".
+        # A socket path whose tail is exactly sessions/<X>/herdr.sock, but
+        # where <X> fails herdr's session name rule (a space, here),
+        # resolves to None, which must never be enabled -- not even by "*".
         self.write_config({"sessions": ["*"]})
-        path = os.path.join(self.tmp.name, "herdr-config", "sessions", "herdr.sock")
+        path = os.path.join(self.tmp.name, "herdr-config", "sessions", "bad name", "herdr.sock")
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
             err = io.StringIO()
             with redirect_stderr(err):
@@ -629,11 +636,23 @@ class SessionAllowlistTest(unittest.TestCase):
         # open-picker's disabled path calls notification.show; with no real
         # socket behind this path, that failure is what actually produces a
         # log line to check the session tag on.
-        path = os.path.join(self.tmp.name, "herdr-config", "sessions", "herdr.sock")
+        path = os.path.join(self.tmp.name, "herdr-config", "sessions", "bad name", "herdr.sock")
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}), redirect_stderr(io.StringIO()):
             self.assertEqual(main(["open-picker"]), 0)
         log_text = (self.root / "shelf.log").read_text()
         self.assertIn("[unknown]", log_text)
+
+    def test_ancestor_sessions_directory_uses_the_default_session(self):
+        # "sessions" here is an unrelated ancestor directory, nowhere near
+        # the end of the path -- this must behave exactly like the default
+        # session, not be disabled.
+        path = os.path.join(self.tmp.name, "sessions", "xdg", "herdr", "herdr.sock")
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                code = main(["list"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("not enabled", err.getvalue())
 
     # -- Mutation-resistance: each of these fails if the corresponding
     # per-session wiring is broken, not just if the gate is broken. --
@@ -648,12 +667,16 @@ class SessionAllowlistTest(unittest.TestCase):
         archive_dir.mkdir(parents=True)
         (archive_dir / "record.json").write_text(json.dumps(_restorable_record("20260101T000000Z-abcdef")))
 
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        # main()'s own now() is fixed so the timestamp it writes can be
+        # compared exactly, rather than calling the real now() again here
+        # and risking the two straddling a second boundary.
+        with mock.patch("shelf.__main__.now", return_value=FIXED_NOW), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             code = main(["restore", "20260101T000000Z-abcdef"])
 
         self.assertEqual(code, 0)
         session_activity = json.loads((self.cao_session / "activity.json").read_text())
-        self.assertEqual(session_activity["claude:S1"]["restored_at"], iso(now()))
+        self.assertEqual(session_activity["claude:S1"]["restored_at"], iso(FIXED_NOW))
         self.assertFalse((self.root / "activity.json").exists())
 
     def test_pick_lists_archives_from_the_session_dir_not_the_root(self):
@@ -806,6 +829,108 @@ class MigrationTest(unittest.TestCase):
         self.assertIn("20260102T000000Z-bbbbbb  also-old", out.getvalue())
         self.assertIn("20260101T000000Z-abcdef  demo", out.getvalue())
         self.assertFalse((self.root / "archive").exists())
+
+
+class MigrationIncompleteGateTest(unittest.TestCase):
+    """If the migration attempt could not fully clear activity.json,
+    installed_at or last_sweep from the root (for example a still-running
+    0.2.x process holds the root locks), sweep and archive must not run
+    against a possibly-incomplete activity history; list (read-only) may
+    still proceed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(os.environ, {
+            "HERDR_PLUGIN_STATE_DIR": self.tmp.name,
+            "XDG_CONFIG_HOME": os.path.join(self.tmp.name, "xdg-config"),
+            "XDG_STATE_HOME": os.path.join(self.tmp.name, "xdg-state"),
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HERDR_SOCKET_PATH", None)
+        os.environ.pop("HERDR_PLUGIN_CONFIG_DIR", None)
+        self.addCleanup(MainTest._reset_shelf_logger)
+        self.root = Path(self.tmp.name)
+
+    def leave_migration_incomplete(self):
+        """Simulate a migration attempt that could not fully clear the
+        root: merge_into_default_session is stubbed out (its own lock
+        behavior is covered separately in tests/test_migrate.py) and a
+        root-level activity.json is left in place, as it would be if a
+        0.2.x process still held the root locks."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "activity.json").write_text("{}")
+        return mock.patch("shelf.__main__.migrate.merge_into_default_session")
+
+    def test_sweep_hook_skips_silently_with_one_log_line(self):
+        with self.leave_migration_incomplete():
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["sweep", "--if-due"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertFalse((self.root / "sessions" / "default" / "last_sweep").exists())
+        log_text = (self.root / "shelf.log").read_text()
+        self.assertEqual(log_text.count("migrating state"), 1)
+
+    def test_manual_sweep_prints_message_and_exits_one(self):
+        with self.leave_migration_incomplete():
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                code = main(["sweep"])
+        self.assertEqual(code, 1)
+        self.assertEqual(err.getvalue().strip(),
+                         "shelf: migrating state from an older version; try again in a moment")
+
+    def test_archive_prints_message_and_exits_one(self):
+        with self.leave_migration_incomplete():
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = main(["archive", "w1:t1"])
+        self.assertEqual(code, 1)
+        self.assertIn("shelf: migrating state from an older version; try again in a moment", err.getvalue())
+
+    def test_list_still_proceeds(self):
+        with self.leave_migration_incomplete():
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main(["list"])
+        self.assertEqual(code, 0)
+        self.assertIn("No archived tabs.", out.getvalue())
+
+    def test_track_is_unaffected(self):
+        # Only sweep and archive are gated on a finished migration; other
+        # commands are unaffected by this specific check.
+        with self.leave_migration_incomplete(), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["track"]), 0)
+
+    def test_gate_lifts_once_installed_at_is_the_only_leftover(self):
+        # The check covers activity.json, installed_at and last_sweep
+        # individually -- installed_at alone is enough to gate.
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "installed_at").write_text("2026-01-01T00:00:00Z\n")
+        with mock.patch("shelf.__main__.migrate.merge_into_default_session"):
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                code = main(["sweep"])
+        self.assertEqual(code, 1)
+        self.assertIn("migrating state", err.getvalue())
+
+    def test_leftover_archive_dir_alone_does_not_gate(self):
+        # archive/ can legitimately remain at the root forever (an
+        # unresolved id collision -- see shelf.migrate); it must not block
+        # sweep/archive on its own.
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "archive.conflict" / "some-id").mkdir(parents=True)
+        (self.root / "archive" / "some-id").mkdir(parents=True)
+        with mock.patch("shelf.__main__.migrate.merge_into_default_session"):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["sweep"])
+        # Not gated by the migrating-state check; whatever happens next
+        # (herdr unreachable in this test) is unrelated to this gate.
+        self.assertNotIn("migrating state", err.getvalue())
 
 
 if __name__ == "__main__":

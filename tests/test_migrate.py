@@ -127,7 +127,7 @@ class MergeIntoDefaultSessionTest(unittest.TestCase):
         self.assertTrue((self.default / "archive" / "20260101T000000Z-aaaaaa" / "record.json").exists())
         self.assertFalse((self.root / "archive").exists())
 
-    def test_colliding_archive_id_is_left_at_the_root_with_a_warning(self):
+    def test_colliding_archive_id_with_different_content_moves_root_copy_to_conflict_dir(self):
         self.write_archive(self.default, "20260101T000000Z-aaaaaa", "already-here")
         self.write_archive(self.root, "20260101T000000Z-aaaaaa", "old")
 
@@ -135,11 +135,64 @@ class MergeIntoDefaultSessionTest(unittest.TestCase):
             migrate.merge_into_default_session(self.root)
 
         self.assertTrue(any("20260101T000000Z-aaaaaa" in m for m in cm.output))
-        # Neither copy was overwritten.
+        # Neither copy was overwritten; the root copy moved aside rather
+        # than staying in archive/ (which would warn again every run).
+        self.assertFalse((self.root / "archive" / "20260101T000000Z-aaaaaa").exists())
         dest = json.loads((self.default / "archive" / "20260101T000000Z-aaaaaa" / "record.json").read_text())
-        src = json.loads((self.root / "archive" / "20260101T000000Z-aaaaaa" / "record.json").read_text())
+        conflict = json.loads(
+            (self.root / "archive.conflict" / "20260101T000000Z-aaaaaa" / "record.json").read_text())
         self.assertEqual(dest["tab"]["label"], "already-here")
-        self.assertEqual(src["tab"]["label"], "old")
+        self.assertEqual(conflict["tab"]["label"], "old")
+
+    def test_colliding_archive_id_with_identical_content_deletes_the_root_copy(self):
+        self.write_archive(self.default, "20260101T000000Z-aaaaaa", "same-everywhere")
+        self.write_archive(self.root, "20260101T000000Z-aaaaaa", "same-everywhere")
+
+        handler = _CapturingHandler()
+        log = logging.getLogger("shelf")
+        log.addHandler(handler)
+        try:
+            migrate.merge_into_default_session(self.root)
+        finally:
+            log.removeHandler(handler)
+
+        self.assertFalse(any(r.levelno >= logging.WARNING for r in handler.records), handler.records)
+        self.assertFalse((self.root / "archive" / "20260101T000000Z-aaaaaa").exists())
+        self.assertFalse((self.root / "archive.conflict").exists())
+        dest = json.loads((self.default / "archive" / "20260101T000000Z-aaaaaa" / "record.json").read_text())
+        self.assertEqual(dest["tab"]["label"], "same-everywhere")
+
+    def test_colliding_archive_id_identity_check_covers_the_sessions_subtree(self):
+        # record.json alone matching is not enough: a copied Claude session
+        # file that differs must still count as "different".
+        self.write_archive(self.default, "20260101T000000Z-aaaaaa", "same-record")
+        self.write_archive(self.root, "20260101T000000Z-aaaaaa", "same-record")
+        (self.default / "archive" / "20260101T000000Z-aaaaaa" / "sessions").mkdir()
+        (self.default / "archive" / "20260101T000000Z-aaaaaa" / "sessions" / "S1.jsonl").write_text("dest-copy\n")
+        (self.root / "archive" / "20260101T000000Z-aaaaaa" / "sessions").mkdir()
+        (self.root / "archive" / "20260101T000000Z-aaaaaa" / "sessions" / "S1.jsonl").write_text("root-copy\n")
+
+        migrate.merge_into_default_session(self.root)
+
+        self.assertFalse((self.root / "archive" / "20260101T000000Z-aaaaaa").exists())
+        self.assertTrue((self.root / "archive.conflict" / "20260101T000000Z-aaaaaa").exists())
+
+    def test_archive_conflict_does_not_warn_again_on_a_second_run(self):
+        self.write_archive(self.default, "20260101T000000Z-aaaaaa", "already-here")
+        self.write_archive(self.root, "20260101T000000Z-aaaaaa", "old")
+        with self.assertLogs("shelf", level="WARNING"):
+            migrate.merge_into_default_session(self.root)
+
+        handler = _CapturingHandler()
+        log = logging.getLogger("shelf")
+        log.addHandler(handler)
+        try:
+            migrate.merge_into_default_session(self.root)
+        finally:
+            log.removeHandler(handler)
+        self.assertEqual(handler.records, [])
+        # The conflict copy from the first run is untouched.
+        self.assertTrue((self.root / "archive.conflict" / "20260101T000000Z-aaaaaa").exists())
 
     def test_non_colliding_ids_still_migrate_alongside_a_collision(self):
         self.write_archive(self.default, "20260101T000000Z-aaaaaa", "already-here")
@@ -150,8 +203,9 @@ class MergeIntoDefaultSessionTest(unittest.TestCase):
             migrate.merge_into_default_session(self.root)
 
         self.assertTrue((self.default / "archive" / "20260102T000000Z-bbbbbb" / "record.json").exists())
-        self.assertTrue((self.root / "archive" / "20260101T000000Z-aaaaaa" / "record.json").exists())
+        self.assertTrue((self.root / "archive.conflict" / "20260101T000000Z-aaaaaa" / "record.json").exists())
         self.assertFalse((self.root / "archive" / "20260102T000000Z-bbbbbb").exists())
+        self.assertFalse((self.root / "archive" / "20260101T000000Z-aaaaaa").exists())
 
     def test_rollback_scenario_migrates_new_archives_on_a_later_run(self):
         # First upgrade: migrate one archive.
@@ -183,13 +237,16 @@ class MergeIntoDefaultSessionTest(unittest.TestCase):
         self.assertEqual(handler.records, [])
 
     def test_error_logged_when_something_remains_after_the_attempt(self):
-        self.write_archive(self.default, "20260101T000000Z-aaaaaa", "already-here")
+        # A collision is now always resolved (moved aside or deleted -- see
+        # the archive.conflict tests), so it can no longer be used to leave
+        # something at the root; simulate an unresolvable failure instead.
         self.write_archive(self.root, "20260101T000000Z-aaaaaa", "old")
-        with self.assertLogs("shelf", level="ERROR") as cm:
-            migrate.merge_into_default_session(self.root)
+        with mock.patch("shelf.migrate._merge_archive", return_value=False):
+            with self.assertLogs("shelf", level="ERROR") as cm:
+                migrate.merge_into_default_session(self.root)
         self.assertTrue(any("could not" in m.lower() or "not migrated" in m.lower() for m in cm.output))
         # The command that triggered this must be able to continue: nothing
-        # about the failed collision raises.
+        # about the failure raises.
         self.assertTrue((self.root / "archive" / "20260101T000000Z-aaaaaa").exists())
 
     # -- activity.json merge semantics --
@@ -234,6 +291,81 @@ class MergeIntoDefaultSessionTest(unittest.TestCase):
 
         self.assertEqual(read_json(self.default / "activity.json", None),
                          {"claude:S": {"first_seen": "2026-09-01T00:00:00Z"}})
+
+    def test_merge_takes_the_destination_activity_lock(self):
+        # A concurrent activity.ActivityStore.update() for this session
+        # (e.g. from a track hook) must be excluded while the merge reads,
+        # merges and rewrites sessions/default/activity.json.
+        _write(self.root / "activity.json", "{}")
+        self.default.mkdir(parents=True)
+        atomic_write_json(self.default / "activity.json", {"claude:S": {"first_seen": "2026-09-01T00:00:00Z"}})
+        seen_locked = {}
+
+        real_merge = migrate._merge_activity_data
+
+        def check_lock_held(dest_data, src_data):
+            try:
+                with FileLock(self.default / "activity.lock", wait_seconds=0):
+                    seen_locked["activity.lock"] = False
+            except Exception:
+                seen_locked["activity.lock"] = True
+            return real_merge(dest_data, src_data)
+
+        with mock.patch("shelf.migrate._merge_activity_data", side_effect=check_lock_held):
+            migrate.merge_into_default_session(self.root)
+        self.assertEqual(seen_locked, {"activity.lock": True})
+
+    def test_concurrent_activity_store_update_during_merge_loses_nothing(self):
+        # A real race, both threads released at once by a barrier: one
+        # merges root activity.json into sessions/default/, the other
+        # concurrently records new activity for a different session via
+        # the normal ActivityStore.update() path. Whichever actually runs
+        # first, activity.lock (see test above) serializes the two, so
+        # neither side's write is lost.
+        from shelf import activity
+
+        _write(self.root / "activity.json", json.dumps({
+            "claude:S": {"first_seen": "2026-09-01T00:00:00Z", "last_active": "2026-09-10T00:00:00Z"},
+        }))
+        self.default.mkdir(parents=True)
+        atomic_write_json(self.default / "activity.json", {
+            "claude:S": {"first_seen": "2026-09-01T00:00:00Z"},
+        })
+        store = activity.ActivityStore(self.default)
+        errors = []
+        ready = threading.Barrier(2)
+
+        def do_merge():
+            ready.wait(5)
+            try:
+                migrate.merge_into_default_session(self.root)
+            except Exception as e:  # pragma: no cover - surfaced via errors
+                errors.append(e)
+
+        def do_update():
+            ready.wait(5)
+
+            def apply(d):
+                d.setdefault("claude:other", {})["first_seen"] = "2026-09-20T00:00:00Z"
+                return True
+            try:
+                store.update(apply)
+            except Exception as e:  # pragma: no cover - surfaced via errors
+                errors.append(e)
+
+        t1 = threading.Thread(target=do_merge)
+        t2 = threading.Thread(target=do_update)
+        t1.start()
+        t2.start()
+        t1.join(10)
+        t2.join(10)
+
+        self.assertEqual(errors, [])
+        final = read_json(self.default / "activity.json", None)
+        self.assertIn("claude:S", final)
+        self.assertEqual(final["claude:S"]["last_active"], "2026-09-10T00:00:00Z")
+        self.assertIn("claude:other", final)
+        self.assertEqual(final["claude:other"]["first_seen"], "2026-09-20T00:00:00Z")
 
     # -- last_sweep / installed_at semantics --
 

@@ -423,19 +423,26 @@ name from `HERDR_SOCKET_PATH` alone. The path is normalized
 the way a real filesystem path would, before any name is extracted from it.
 It returns:
 
-- the `<name>` in a normalized path ending `sessions/<name>/herdr.sock`, when
-  `<name>` passes herdr's own session name rule (letters, digits, `.`, `_` or
-  `-`, 1-64 characters, and not exactly `.` or `..`);
-- `"default"` for anything that does not name a session at all, including a
+- the `<name>` in a normalized path whose tail is exactly
+  `sessions/<name>/herdr.sock` -- that is, `sessions` is the
+  third-from-last path component, immediately followed by the name and
+  then `herdr.sock` -- when `<name>` passes herdr's own session name rule
+  (letters, digits, `.`, `_` or `-`, 1-64 characters, and not exactly `.`
+  or `..`);
+- `"default"` for anything that does not match that exact tail, including a
   missing or empty socket path (used by `list`, the only command that runs
-  without `HERDR_SOCKET_PATH` at all -- see Command line in the README);
-- `None` -- a disabled session, never `"default"` -- when the path clearly
-  names a session (it has a `sessions` component in the normalized path) but
-  no valid name could be parsed there: a missing name, a name containing a
-  path separator, or a name that fails the rule above. `None` is always
-  treated as disabled by `__main__`, regardless of `sessions` in config.json
-  (including `"*"`): with no reliable name, there is nothing to safely
-  enable.
+  without `HERDR_SOCKET_PATH` at all -- see Command line in the README), a
+  path with no name between `sessions` and `herdr.sock`, or an unrelated
+  ancestor directory that happens to be named `sessions` (for example
+  `/data/sessions/xdg/herdr/herdr.sock`, where `sessions` is nowhere near
+  the end) -- only the exact tail shape is ever considered, so a `sessions`
+  component anywhere else in the path is not treated specially at all;
+- `None` -- a disabled session, never `"default"` -- only when that exact
+  tail shape is present but `<name>` fails the rule above (for example a
+  name containing whitespace or an unsupported character, or one over 64
+  characters). `None` is always treated as disabled by `__main__`,
+  regardless of `sessions` in config.json (including `"*"`): with no
+  reliable name, there is nothing to safely enable.
 
 `config.session_enabled(cfg, name)` is `"*" in cfg["sessions"] or name in
 cfg["sessions"]`. `config.sessions_for_gate(config_dir)` reads just the
@@ -473,6 +480,21 @@ command on it:
   invocation regardless of session: it is a shared, root-level concern, not
   tied to any one session's allowlist, so it also runs -- and logs to the
   shared `shelf.log` -- from a disabled session's hooks.
+- `sweep` and `archive` are additionally gated on the migration having
+  actually cleared the root: if `activity.json`, `installed_at` or
+  `last_sweep` still exists directly at the state root after the migration
+  attempt above (for example because a still-running pre-0.3.0 process held
+  the root locks `shelf.migrate` needs), sweep and archive must not run
+  against what could be an incomplete activity history. `sweep --if-due`
+  returns 0 and logs one line; the manual `sweep` and `archive` commands
+  print `shelf: migrating state from an older version; try again in a
+  moment` and exit 1. `archive/` itself is deliberately not part of this
+  check -- an archive id collision (see State directory layout) always
+  ends up resolved into either nothing (identical, deleted) or
+  `archive.conflict/<id>` (different, moved aside), and that resolution can
+  legitimately be the permanent, final state, so its presence must never
+  block sweep/archive. `track`, `open-picker`, `restore`, `pick` and the
+  read-only `list` are unaffected by this specific check.
 
 ## State directory layout
 
@@ -489,6 +511,8 @@ sessions/<name>/archive/<archive-id>/sessions/...  copies of Claude session file
 sessions/<name>/installed_at         ISO time of the first sweep ever run, for this herdr session
 sessions/<name>/last_sweep           ISO time of the last completed sweep, for this herdr session
 sessions/<name>/sweep.lock           held for the duration of a sweep, a restore, or a picker delete
+archive.conflict/<archive-id>/...    a pre-0.3.0 archive whose id collided with one already migrated
+                                      and differed from it; left here, untouched, for a human to resolve
 migrate.lock                         held while pre-0.3.0 root-level state is moved into sessions/default/
 config-error.lock                    held while a broken config.json is reported
 config-error-notified                mtime marks the last "config.json is invalid" notification
@@ -535,33 +559,48 @@ partway through must finish on a later run. Instead:
 3. Each of the four items is merged independently, never overwriting a
    destination that already exists:
    - `archive/<id>`: moved into `sessions/default/archive/<id>` unless that
-     id already exists there, in which case the root copy is left in place
-     with a logged warning (archive ids are validated on save, so they
-     cannot be renamed to something like `<id>.migrated-<ts>` without
-     breaking that validation; leaving it is the safe choice).
+     id already exists there. On a collision, the two folders (`record.json`
+     plus any copied Claude session files under `sessions/`) are compared
+     byte for byte: if identical, the root copy is simply redundant and is
+     deleted; otherwise it is a genuine conflict, moved to
+     `<root>/archive.conflict/<id>` (outside `archive/`, so
+     `root_legacy_present` no longer sees it and a later invocation does not
+     warn about it again) and logged once as a warning. Archive ids are
+     validated on save, so a colliding id cannot be renamed to something
+     like `<id>.migrated-<ts>` without breaking that validation; moving the
+     whole folder aside under its own id, one level up, avoids that.
    - `activity.json`: moved as-is if the destination doesn't exist yet;
      otherwise merged session by session -- for each session key, whichever
      side has the later `last_active`, `restored_at` and `agent_started_at`
      wins, field by field, with every other field defaulting to the
      destination's; `"terminals"` is a union, keyed by terminal id, with the
-     same later-wins rule per entry.
+     same later-wins rule per entry. The read-merge-write of the
+     destination itself is done under `sessions/default/activity.lock` --
+     the same lock `activity.ActivityStore` uses -- so a concurrent
+     `ActivityStore.update()` for that session (for example a `track` hook
+     firing at the same time) is serialized with the merge rather than
+     racing it, and neither write is lost regardless of which runs first.
    - `last_sweep`: the destination wins whenever it already exists.
    - `installed_at`: the earlier of the two wins whenever both exist -- the
      plugin's install time should not appear to move later just because a
      session was migrated.
-4. Whatever was actually moved is logged as one info line
+4. Whatever was actually moved or resolved is logged as one info line
    (`"migrated legacy state into sessions/default: <items>"`). If anything
-   is still left at the root once the attempt is done (an archive id
-   collision, or a failure logged along the way), that is logged as an
-   error, but `merge_into_default_session` still returns normally: the
-   command that triggered it always gets to run, and the next invocation
-   retries whatever is left.
+   is still left at the root once the attempt is done (a failure logged
+   along the way -- an archive id collision no longer counts, since it is
+   always resolved one way or the other), that is logged as an error, but
+   `merge_into_default_session` still returns normally: the command that
+   triggered it always gets to run, and the next invocation retries
+   whatever is left. `__main__` additionally gates `sweep` and `archive`
+   (but not `track`, `open-picker`, `restore`, `pick` or the read-only
+   `list`) on `activity.json`, `installed_at` and `last_sweep` actually
+   being clear of the root -- see Herdr session allowlist above.
 
 Concurrent callers (two commands firing at once, for example a hook and a
-manual command) are serialized by the three locks above: the second one to
-acquire them finds the first one's work already done (or already failed and
-logged), and its own merge functions are no-ops for anything no longer at
-the root, so nothing is duplicated or lost either way.
+manual command) are serialized by the three root-level locks above: the
+second one to acquire them finds the first one's work already done (or
+already failed and logged), and its own merge functions are no-ops for
+anything no longer at the root, so nothing is duplicated or lost either way.
 
 `last_status` (per session, alongside `first_seen`/`last_active`/`restored_at`) is
 the last `agent_status` recorded for that session, used to tell a real status

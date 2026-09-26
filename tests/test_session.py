@@ -27,24 +27,41 @@ class HerdrSessionNameTest(unittest.TestCase):
         self.assertEqual(
             session.herdr_session_name("/x/sessions/my-session.1/herdr.sock"), "my-session.1")
 
-    # -- A path that clearly names a session, but from which no valid name
-    # can be parsed, is None (disabled) -- never silently "default". --
+    # -- Only the exact ".../sessions/<name>/herdr.sock" tail is special
+    # ("sessions" as the third-from-last component). Anything else --
+    # including a path that merely has a "sessions" component somewhere
+    # else, or the tail shape but no room for a name -- resolves to
+    # "default" rather than being disabled. --
 
-    def test_sessions_directory_without_a_name_is_none(self):
-        # No <name> segment between "sessions" and "herdr.sock".
-        self.assertIsNone(session.herdr_session_name("/home/user/.config/herdr/sessions/herdr.sock"))
+    def test_sessions_directory_without_a_name_is_default(self):
+        # No <name> segment between "sessions" and "herdr.sock": "sessions"
+        # ends up second-from-last, not third-from-last, so the tail
+        # pattern does not match at all.
+        self.assertEqual(session.herdr_session_name("/home/user/.config/herdr/sessions/herdr.sock"), "default")
 
-    def test_wrong_socket_filename_under_sessions_is_none(self):
-        self.assertIsNone(
-            session.herdr_session_name("/home/user/.config/herdr/sessions/cao/other.sock"))
+    def test_wrong_socket_filename_under_sessions_is_default(self):
+        # The filename itself isn't "herdr.sock", so the tail pattern does
+        # not match, regardless of "sessions" appearing in the path.
+        self.assertEqual(
+            session.herdr_session_name("/home/user/.config/herdr/sessions/cao/other.sock"), "default")
 
-    def test_double_slash_collapsing_the_name_is_none(self):
+    def test_double_slash_collapsing_the_name_is_default(self):
         # os.path.normpath collapses the doubled slash, leaving "sessions"
-        # immediately followed by "herdr.sock" with no name in between.
-        self.assertIsNone(session.herdr_session_name("/x/sessions//herdr.sock"))
+        # immediately followed by "herdr.sock" with no name in between --
+        # same as the no-name case above.
+        self.assertEqual(session.herdr_session_name("/x/sessions//herdr.sock"), "default")
 
-    def test_name_with_a_path_separator_is_none(self):
-        self.assertIsNone(session.herdr_session_name("/x/sessions/a/b/herdr.sock"))
+    def test_name_with_a_path_separator_is_default(self):
+        # "sessions" is not the third-from-last component here ("b" is
+        # second-from-last, "a" third-from-last), so the tail pattern does
+        # not match; there is no "<name>" slot to even validate.
+        self.assertEqual(session.herdr_session_name("/x/sessions/a/b/herdr.sock"), "default")
+
+    def test_unrelated_ancestor_directory_named_sessions_is_default(self):
+        # "sessions" here is nowhere near the end of the path -- an
+        # ordinary ancestor directory that happens to share the name, not
+        # herdr's own sessions/<name>/herdr.sock shape.
+        self.assertEqual(session.herdr_session_name("/data/sessions/xdg/herdr/herdr.sock"), "default")
 
     def test_name_containing_dots_but_not_only_dots_is_accepted(self):
         # Only the exact names "." and ".." are reserved; a name that merely
@@ -71,10 +88,11 @@ class HerdrSessionNameTest(unittest.TestCase):
         # longer names a session at all.
         self.assertEqual(session.herdr_session_name("/x/sessions/../herdr.sock"), "default")
 
-    def test_dotdot_after_the_name_collapses_it_to_none(self):
+    def test_dotdot_after_the_name_collapses_to_default(self):
         # "cao/.." cancels out, leaving "sessions" directly before
-        # "herdr.sock" with no name -- same as the no-name case above.
-        self.assertIsNone(session.herdr_session_name("/x/sessions/cao/../herdr.sock"))
+        # "herdr.sock" with no name -- same as the no-name case above, so
+        # this resolves to "default" rather than being disabled.
+        self.assertEqual(session.herdr_session_name("/x/sessions/cao/../herdr.sock"), "default")
 
     def test_doubled_slashes_elsewhere_are_tolerated(self):
         self.assertEqual(session.herdr_session_name("/x//sessions/cao/herdr.sock"), "cao")

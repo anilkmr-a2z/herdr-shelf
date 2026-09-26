@@ -220,13 +220,24 @@ archived tab), `activity.json`, and the sweep schedule -- lives under
 state root, shared by every herdr session that ran Shelf. On upgrading,
 those are moved into `sessions/default/` automatically -- merged in, never
 overwritten, and self-healing if a run is interrupted or a version is rolled
-back and used before upgrading again. Since every pre-0.3.0 session's
+back and used before upgrading again. An archived tab whose id happens to
+collide with one already migrated is moved aside to
+`archive.conflict/<id>` at the state root if it differs (or simply dropped
+if it is an exact duplicate), left there for you to look at by hand; Shelf
+itself never reads that folder again. Since every pre-0.3.0 session's
 archives land in the same `sessions/default/`, removing `"default"` from
 `sessions` hides all of them (they are still on disk, just not listed or
 restorable until `"default"` is back in `sessions`). To roll back to a
 version before 0.3.0, move the contents of `sessions/default/` back up to
 the state root before installing the older version, since it only looks
 there.
+
+While that migration is still in progress -- normally an instant, but it can
+be held up if an older version is still running somewhere -- `sweep` and
+`archive` refuse rather than act on what might be an incomplete activity
+history: hooks skip silently, and the manual commands print `shelf:
+migrating state from an older version; try again in a moment` and exit 1.
+`list` keeps working throughout, since it only reads.
 
 Config: the directory printed by `herdr plugin config-dir shelf`, shared by
 every herdr session.

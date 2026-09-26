@@ -24,6 +24,18 @@ CONFIG_ERROR_NOTIFY_INTERVAL_SECONDS = 3600
 # _session_name. Such a session is always disabled; this is display-only.
 _UNKNOWN_SESSION_DISPLAY = "unknown"
 
+# Root-level files a pre-0.3.0 process still reads and writes. If any of
+# these are still at the root after a migration attempt (for example a
+# still-running 0.2.x process held the root locks migrate.py needs), sweep
+# and archive must not run against what could be an incomplete activity
+# history. archive/ is deliberately not included: an archive id collision
+# always ends up resolved (deleted if identical, moved to
+# archive.conflict/<id> if not -- see shelf.migrate), and that resolution
+# can legitimately be the permanent, final state, so it must never block
+# sweep/archive.
+_MIGRATION_MARKERS = ("activity.json", "installed_at", "last_sweep")
+_MIGRATING_MESSAGE = "shelf: migrating state from an older version; try again in a moment"
+
 log = logging.getLogger("shelf")
 
 
@@ -86,6 +98,10 @@ def _session_allowed(session_name, config_dir) -> bool:
         return False
     sessions = config.sessions_for_gate(config_dir)
     return config.session_enabled({"sessions": sessions}, session_name)
+
+
+def _migration_incomplete(root: Path) -> bool:
+    return any((root / name).exists() for name in _MIGRATION_MARKERS)
 
 
 def _disabled_message(session_name) -> str:
@@ -297,6 +313,12 @@ def _dispatch(command: str, args: list, state: Path, session_name) -> int:
             # when a sweep is not due anyway. sweep.run() re-checks with the
             # real configured interval once it does load config below.
             return 0
+        if _migration_incomplete(state):
+            if if_due:
+                log.info("sweep: migrating state from an older version; skipping this sweep")
+                return 0
+            print(_MIGRATING_MESSAGE, file=sys.stderr)
+            return 1
         if not allowed():
             if if_due:
                 return 0
@@ -365,6 +387,9 @@ def _dispatch(command: str, args: list, state: Path, session_name) -> int:
             print(f"{rec['id']}  {_describe(rec, now())}")
         return 0
     if command == "archive":
+        if _migration_incomplete(state):
+            print(_MIGRATING_MESSAGE, file=sys.stderr)
+            return 1
         if not allowed():
             print(_disabled_message(session_name), file=sys.stderr)
             return 1

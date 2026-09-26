@@ -35,13 +35,18 @@ def herdr_session_name(socket_path):
     rule), or "default" for anything that does not name a session at all --
     including a missing or empty socket path.
 
-    Returns None -- a disabled session, never "default" -- when the path
-    clearly names a session (it has a "sessions" component) but no valid
-    name could be parsed there: a missing name, a name containing a path
-    separator, or a name that fails validation. A path in this shape is
-    never mapped to "default": that would risk silently treating a
-    malformed or unexpected session path as the one session enabled by
-    default.
+    Returns None -- a disabled session, never "default" -- only when the
+    normalized path's own tail is exactly "sessions/<X>/herdr.sock" (that
+    is, "sessions" is the third-from-last component, immediately preceding
+    the last two) but <X> fails validation: a name containing a path
+    separator (so there is no such "sessions" component at that exact
+    position at all), or a name that otherwise fails the rule above. Only
+    that specific tail shape is considered: an unrelated ancestor directory
+    that happens to be named "sessions" (for example
+    "/data/sessions/xdg/herdr/herdr.sock", where "sessions" is nowhere near
+    the end) does not match it and resolves to "default" instead -- mapping
+    it to None would risk disabling a socket path that never named a
+    session in the first place.
     """
     if not socket_path:
         return "default"
@@ -50,6 +55,4 @@ def herdr_session_name(socket_path):
     if len(parts) >= 3 and parts[-1] == "herdr.sock" and parts[-3] == "sessions":
         name = parts[-2]
         return name if _valid_session_name(name) else None
-    if "sessions" in parts:
-        return None
     return "default"
