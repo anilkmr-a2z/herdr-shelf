@@ -22,6 +22,7 @@ class ManifestTest(unittest.TestCase):
                          {"pane.agent_status_changed", "pane.agent_detected", "workspace.focused"})
         self.assertEqual(m["panes"][0]["id"], "picker")
         self.assertEqual(m["panes"][0]["placement"], "popup")
+        self.assertEqual((m["panes"][0]["width"], m["panes"][0]["height"]), ("80%", 18))
 
 
 if __name__ == "__main__":

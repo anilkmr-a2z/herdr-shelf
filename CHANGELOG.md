@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0 - unreleased
+
+- Redesign the restore picker as an arrow-key popup. Archived tabs are
+  grouped by when they were archived: Archived today, Last 7 days, Last 30
+  days, and Older, which starts collapsed. The list shows 10 rows and
+  scrolls, so every entry is reachable from the popup. Enter restores,
+  Right/Left open and close a group, `/` filters by tab, workspace or agent
+  name, `d` deletes after a `[y/N]` confirmation, and one press of q or Esc
+  closes it. A details line shows the highlighted tab's directory, when it
+  was shelved, and its panes. Clicks, double-clicks and the wheel work too
+  (wheel-down needs an ncurses with mouse version 2).
+- **Behavior change:** the number shortcuts (`3` to restore, `d 3` to delete)
+  are gone, and the popup is now 18 rows tall instead of 80% of the screen.
+- The picker now uses Python's built-in `curses` module.
+
 ## 0.3.0 - 2026-09-26
 
 - Add a herdr-session allowlist: a new `"sessions"` config key (default

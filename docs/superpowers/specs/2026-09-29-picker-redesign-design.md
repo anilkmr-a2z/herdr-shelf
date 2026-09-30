@@ -48,7 +48,7 @@ This is the popup as it opens, with 11 entries:
    style-guide        docs      claude  42d
  v 1 more
  ~/src/backend  shelved Sep 29 09:14  1 pane: codex
- Up/Down move  Enter restore  Right/Left open/close  / filter  d delete  q quit
+ Enter restore  Right/Left open/close  / filter  d delete  q quit
 ```
 
 The row below the window is the collapsed `+ Older (4)` header.
@@ -65,7 +65,8 @@ From the top:
 6. **Status line:** the key hints; or, when there is one, a message, a filter
    being typed, or a delete confirmation.
 
-The highlighted row is drawn in reverse video and marked with `>`. A tab row
+The highlighted row is drawn in reverse video; a highlighted tab row is also
+marked with `>`. A tab row
 shows the tab label, workspace label, agent names and idle days (`17d`), each
 column truncated to fit the width, as the current picker does.
 
@@ -73,7 +74,10 @@ The manifest's popup height changes from `"80%"` to `18` (terminal cells):
 the 15 lines above plus the border and one spare. The width stays `"80%"`.
 If the terminal is shorter, rows are dropped in this order: the details line,
 then the markers, then list rows. Below 5 rows or 30 columns the popup shows
-only `Popup too small`.
+only `Popup too small`, and only q and Esc work.
+
+Lines are cut at the right edge. A label with wide characters (CJK, emoji)
+can lose its later columns, but it never wraps into the next row.
 
 ## Groups
 
@@ -85,7 +89,9 @@ only `Popup too small`.
   - "Last 30 days": `d` is 7 to 29.
   - "Older": `d` is 30 or more, or `archived_at` is missing or unparseable.
 - Calendar days, not 24-hour periods: a tab shelved at 23:50 yesterday is in
-  "Last 7 days" at 00:10 today. This also keeps DST changes out of the math.
+  "Last 7 days" at 00:10 today. Each `archived_at` is read with the DST offset
+  of its own date, so an entry from before a clock change still shows the
+  local time it was shelved and lands in the right group.
 - Within a group, entries are sorted most recently archived first. Ties
   (tabs archived by the same sweep) go to the least idle first.
 - Each tab row still shows its idle days.
@@ -115,7 +121,8 @@ only `Popup too small`.
 | q | Close | Typed as text | Cancel |
 
 j, k, h, l, d, q and / are typed as filter text while filtering. Any key not in
-the table cancels a delete confirmation.
+the table (Tab, a function key, Delete) cancels a delete confirmation. Esc on
+an empty filter only leaves filter mode; the cursor stays where it was.
 
 ## Filter
 
@@ -134,8 +141,12 @@ the table cancels a delete confirmation.
 - A double-click on a tab row restores it.
 - The wheel moves the cursor three rows.
 - Clicks outside the list window are ignored.
-- Python 3.9 may not export `BUTTON5_PRESSED`. Look it up with `getattr` and
-  treat a missing constant as "no wheel-down event".
+- While a filter is being typed, a click or the wheel keeps the filter, goes
+  back to moving, and then acts as it would there.
+- A slow click (a press, then a release) counts as a click.
+- Python 3.9 does not export `BUTTON5_PRESSED`. When `BUTTON4_PRESSED` is
+  `2 << 15` (ncurses' mouse version 2), wheel-down is `2 << 20`; otherwise
+  there is no wheel-down.
 
 ## Actions and messages
 
@@ -152,11 +163,27 @@ the table cancels a delete confirmation.
     `DELETE_LOCK_WAIT_SECONDS` for the sweep lock, then deletes.
   - A busy lock shows the same sweep-running message.
 - **Messages:** a message stays until the next key press.
-- **After any action:** the archive is re-read, and the cursor stays on the
-  same entry id if it still exists (otherwise on the row at the same
-  position).
+- **After any action:** the archive is re-read.
+  - The cursor stays on the same entry, or on the same group header, if it
+    still exists; otherwise it stays at the same position.
+  - A group that gains its first entries opens, as at start-up (Older only if
+    it is the only group).
+  - While filtering, every group with a match is shown open.
 - **Empty archive:** the popup shows `No archived tabs.` and
   `Press any key to close.`
+
+## Smaller details
+
+- `y` or `Y` confirms a delete.
+- With a filter set but not being typed, the status line shows
+  `/<text>  (Esc clears the filter)`.
+- An `archived_at` in the future (a clock that ran ahead) counts as Archived
+  today.
+- Ctrl-C closes the popup, except during a restore, when it is ignored.
+- A click during a delete confirmation only cancels it.
+- The wheel works anywhere in the popup, not only over the list.
+- After a re-read, Older opens when it becomes the only group, even if it had
+  been closed.
 
 ## Architecture
 
@@ -201,15 +228,21 @@ input into events, and carries out actions.
   - `os.environ.setdefault("ESCDELAY", "25")` before curses starts, so a
     single Esc closes the popup within about 25 ms instead of ncurses' default
     1 s.
-  - `curses.wrapper`, `keypad(True)`, `curs_set(0)`, and `mousemask` for
-    clicks and the wheel.
+  - `curses.wrapper` (which also turns on keypad mode), `curs_set(0)`,
+    `use_default_colors()` so the terminal's own colours stay, and
+    `mousemask` for clicks and the wheel.
+  - Lines are drawn with `insstr`, which stops at the right margin instead
+    of wrapping.
 - **Input:** `get_wch` reads keys, so the filter accepts any character.
 - **Esc versus arrow keys:** in keypad mode herdr sends arrows as `ESC O B`,
   which curses decodes. If herdr ever sent `ESC [ B` instead, curses would
   return the three bytes separately, and the first would read as Esc and
   close the popup. So on a lone Esc, the loop reads the next byte without
-  blocking. If it is `[` or `O` followed by `A`-`D`, the loop maps it to an
-  arrow; otherwise it is Esc.
+  blocking. If nothing follows, it is Esc. If `[` or `O` follows, the loop
+  maps the final letter to an arrow (or Home/End), and ignores any other
+  sequence. Esc followed by any other key (Alt+key) is ignored too, rather
+  than closing the popup. Any other unmapped key becomes an `"other"` event,
+  which cancels a delete confirmation.
 - **Resize:** `KEY_RESIZE` becomes `("resize", h, w)` from `getmaxyx()`.
 - **Actions:** restore and delete run with the same locking as today. The
   loop draws the status message first, then does the work.
@@ -255,7 +288,8 @@ Only features available in Python 3.9 are used; the test matrix stays
   is gone.
 
 **Render tests:**
-- Exact lines for an 11-entry fixture at 80x18.
+- Exact lines for an 11-entry fixture at 80x16 (the terminal inside the
+  18-row popup).
 - Narrow widths.
 - Both scroll markers.
 - Dropping rows as the height shrinks, and `Popup too small`.
@@ -268,7 +302,15 @@ Only features available in Python 3.9 are used; the test matrix stays
 - The parent sends Down then Enter as `ESC O B` `\r`, and in a second case as
   `ESC [ B` `\r`. It then checks that the second entry was restored and that
   the child exited.
-- The test is skipped if curses cannot start.
+- A third case sends one Esc and checks that the child exits within 0.5 s of
+  the key.
+- A fourth case sends Enter 0.2 s after `ESC [ B`, so reads must block again
+  after an Esc.
+- The test is skipped when Python has no curses module.
+
+**Key and mouse decoding tests:** `_read_event` and `_mouse_event` take the
+curses module as an argument, so a stand-in module drives them without a
+terminal.
 
 Verification before release:
 

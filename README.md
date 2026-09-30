@@ -80,12 +80,25 @@ their tabs qualify no earlier than `idle_days` after install.
 
 ## Restore
 
-Press your picker key. The popup lists archived tabs, newest first, as many
-as fit the popup. When more archived tabs exist than fit, restore the rest
-with `python3 -m shelf restore <id>` (ids from `python3 -m shelf list`). Type
-a number to restore one, `d <number>` to delete one, `q` to close, or Esc
-then Enter to close. Deleting asks for confirmation (`[y/N]`, default no) and
-is permanent: there is no undo.
+Press your picker key. The popup groups archived tabs by when they were
+archived: Archived today, Last 7 days, Last 30 days, and Older. Older starts
+collapsed, unless it is the only group. The list shows 10 rows and scrolls.
+A line under it shows the highlighted tab's directory, when it was shelved,
+and its panes.
+
+| Key | Does |
+|---|---|
+| Up/Down (or k/j), PgUp/PgDn, Home/End | Move |
+| Enter | Restore the highlighted tab, or open/close a group |
+| Right/Left (or l/h) | Open/close a group |
+| `/` | Filter by tab, workspace or agent name; Enter keeps it, Esc clears it |
+| `d` | Delete the highlighted tab |
+| q or Esc | Close |
+
+A click highlights a row, a double-click restores it, a click on a group
+header opens or closes it, and the wheel scrolls (wheel-down needs an
+ncurses with mouse version 2; some older curses builds lack it). Deleting asks for
+confirmation (`[y/N]`, default no) and is permanent: there is no undo.
 
 A restored tab goes back to the workspace with the same name (recreated if it
 is gone) with the same splits, labels and directories. Each agent is started

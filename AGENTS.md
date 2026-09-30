@@ -34,7 +34,9 @@ for the full design (activity model, eligibility rules, state layout).
   `capture()` builds a record; `archive_tab()` writes it, then closes the tab.
 - `shelf/restore.py`: rebuilds a tab from an archive record and resumes its
   agents, under `sweep.lock`.
-- `shelf/picker.py`: popup UI listing archived tabs (restore/delete/quit).
+- `shelf/picker.py`: the restore popup. Pure logic (`State`, `reduce`,
+  `render`, `apply`) tested without a terminal, plus a thin curses loop
+  (`run`); `tests/test_picker_tty.py` drives that loop in a pseudo-terminal.
 - `shelf/session.py`: `herdr_session_name()` -- recovers the herdr session
   name from `HERDR_SOCKET_PATH`.
 - `shelf/migrate.py`: one-way, self-healing merge of pre-0.3.0 root-level

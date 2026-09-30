@@ -254,14 +254,20 @@ def _pick(state: Path) -> int:
             except HerdrError as e:
                 log.warning("notification failed: %s", e)
 
-        # input_fn and print_fn are passed explicitly (rather than relying
-        # on picker.run's own defaults) so a test's mock.patch("builtins.
-        # input"/"builtins.print") actually takes effect: a default
-        # parameter value is bound once when picker.py is first imported,
-        # long before any test patches builtins.input, so picker.run's own
-        # default would keep calling the original, real input() no matter
-        # what is patched later.
-        picker.run(arch, do_restore, now, input_fn=input, print_fn=print, notify=notify)
+        # The popup's terminal belongs to curses while it runs: a log line on
+        # stderr (a restore logs several) would draw over it. shelf.log
+        # still gets every line.
+        on_stderr = [h for h in log.handlers if type(h) is logging.StreamHandler]
+        for handler in on_stderr:
+            log.removeHandler(handler)
+        quiet = logging.NullHandler()  # with no shelf.log, logging.lastResort would write to stderr
+        log.addHandler(quiet)
+        try:
+            picker.run(arch, do_restore, now, notify=notify)
+        finally:
+            log.removeHandler(quiet)
+            for handler in on_stderr:
+                log.addHandler(handler)
     except (EOFError, KeyboardInterrupt):
         pass
     except Exception as e:

@@ -149,24 +149,17 @@ class MainTest(unittest.TestCase):
         self.assertTrue(log_path.exists())
         self.assertIn("pick failed", log_path.read_text())
 
-    def test_pick_passes_input_fn_explicitly_so_mocking_builtins_input_works(self):
-        # picker.run's own input_fn parameter defaults to the *original*
-        # input builtin, bound once when picker.py was first imported --
-        # long before any test's mock.patch("builtins.input") runs. If
-        # _pick ever calls picker.run() without passing input_fn (relying
-        # on that default), a test patching builtins.input has no effect on
-        # it, and a real "pick" invocation with an unmocked, blocking stdin
-        # would hang instead of failing fast (caught by running the suite
-        # with stdin attached to a non-EOF, terminal-like source, where
-        # this exact gap once hung test_pick_lists_archives_from_the_
-        # session_dir_not_the_root). This test catches a regression of that
-        # without needing a blocking stdin itself.
-        with mock.patch("shelf.__main__.picker.run") as picker_run, \
+    def test_pick_keeps_log_lines_off_the_popup_while_it_runs(self):
+        seen = []
+
+        def fake_run(arch, do_restore, now_fn, notify=None, **kwargs):
+            seen.append([type(h) for h in logging.getLogger("shelf").handlers])
+
+        with mock.patch("shelf.__main__.picker.run", side_effect=fake_run), \
                 mock.patch("shelf.__main__.Client"), redirect_stderr(io.StringIO()):
             self.assertEqual(main(["pick"]), 0)
-        picker_run.assert_called_once()
-        self.assertIs(picker_run.call_args.kwargs.get("input_fn"), input)
-        self.assertIs(picker_run.call_args.kwargs.get("print_fn"), print)
+        self.assertEqual(seen, [[logging.FileHandler, logging.NullHandler]])
+        self.assertIn(logging.StreamHandler, [type(h) for h in logging.getLogger("shelf").handlers])
 
     def test_unknown_command(self):
         with redirect_stderr(io.StringIO()):
@@ -688,10 +681,12 @@ class SessionAllowlistTest(unittest.TestCase):
             "id": "20260101T000000Z-abcdef", "archived_at": "2026-01-01T00:00:00Z",
             "tab": {"label": "distinctive-label"}, "workspace": {"label": None}, "panes": {},
         }))
-        out = io.StringIO()
-        with mock.patch("builtins.input", return_value="q"), redirect_stdout(out), redirect_stderr(io.StringIO()):
+        listed = []
+        with mock.patch("shelf.__main__.picker.run",
+                        side_effect=lambda arch, *a, **k: listed.extend(arch.list())), \
+                redirect_stderr(io.StringIO()):
             self.assertEqual(main(["pick"]), 0)
-        self.assertIn("distinctive-label", out.getvalue())
+        self.assertEqual([r["tab"]["label"] for r in listed], ["distinctive-label"])
 
     def test_invalid_config_fallback_does_not_enable_other_sessions(self):
         # "sessions" is absent, and idle_days is invalid: the gate's

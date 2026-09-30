@@ -350,7 +350,7 @@ id = "picker"
 title = "Shelf"
 placement = "popup"
 width = "80%"
-height = "80%"
+height = 18
 command = ["python3", "-m", "shelf", "pick"]
 ```
 
@@ -868,10 +868,11 @@ For other agents, their own session retention applies.
 
 ### Picker (`pick`)
 
-Opened by the `restore` action through `plugin.pane.open`. It lists archived tabs
-newest first: number, tab label, workspace label, agent, and days since last
-activity. Typing a number restores that entry, `d <number>` deletes one, and `q`
-closes the popup. It uses plain `input()` with no curses dependency.
+Opened by the `restore` action through `plugin.pane.open`. A curses popup,
+18 rows tall. It groups archived tabs by when they were archived (Archived
+today, Last 7 days, Last 30 days, Older; Older collapsed). It has arrow keys,
+Enter to restore, `d` to delete, `/` to filter, mouse support, and q or Esc
+to close. See `2026-09-29-picker-redesign-design.md` for the full design.
 
 ### Manual archive (`archive <tab-id>`)
 
@@ -885,9 +886,9 @@ entry. Used for the release check and for archiving a tab by hand.
 - An error on one tab is logged and the sweep continues with the next tab.
 - Errors go to `shelf.log` and to stderr, which herdr keeps in `herdr plugin log`.
 - A restore that fails to apply the layout keeps the archive entry and shows the
-  error in the popup itself (not a notification): the picker prints "Restore
-  failed: ..." and waits for Enter before re-rendering the list, so the entry is
-  still there to retry. Once `layout.apply` has succeeded, though, the tab is
+  error in the popup itself (not a notification): the picker's status line shows
+  "Restore failed: ..." until the next key press, and the entry is still there
+  to retry. Once `layout.apply` has succeeded, though, the tab is
   live and the entry is always deleted, even if recording `restored_at`
   afterward fails; that failure is only logged.
 - Locks use `fcntl.flock`, so a lock held by a process that dies is released by
