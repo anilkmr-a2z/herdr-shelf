@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 - unreleased
+## 0.4.0 - 2026-09-30
 
 - Redesign the restore picker as an arrow-key popup. Archived tabs are
   grouped by when they were archived: Archived today, Last 7 days, Last 30
