@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 - unreleased
+
+- Add the `shelf.archive-tab` action: bound to a key, it asks whether to
+  archive the current tab, showing when it was last active and warning about
+  anything unusual (a working pane, a pane that would come back as a shell,
+  a conversation open elsewhere), and archives it on `y`. It refuses only
+  when the entry could not be restored correctly. herdr cannot add plugin
+  entries to its right-click menus, so a key is the way in; see the README
+  for the binding.
+- `python3 -m shelf archive <tab-id>` now archives the focused tab too.
+
 ## 0.4.0 - 2026-09-30
 
 - Redesign the restore picker as an arrow-key popup. Archived tabs are

@@ -36,6 +36,18 @@ settings). Many macOS terminals turn alt chords into characters instead of
 sending them as key events, so `prefix+alt+...` bindings often do nothing
 there.
 
+To also archive the current tab on demand (see
+[Archive a tab now](#archive-a-tab-now)), add a second key; `prefix+shift+a`
+is unbound in the default keymap too:
+
+```toml
+[[keys.command]]
+key = "prefix+shift+a"
+type = "plugin_action"
+command = "shelf.archive-tab"
+description = "archive the current tab"
+```
+
 ## It starts in dry-run
 
 Out of the box Shelf only reports. Each sweep shows a notification like
@@ -53,8 +65,8 @@ A tab is archived when all of these hold:
 - nothing in the tab is `working`;
 - it is not the focused tab.
 
-A blocked agent (waiting on you) follows the same rule. Tabs with no agent are
-never touched. Shell panes inside an archived agent tab come back as shells in
+A blocked agent (waiting on you) follows the same rule. A sweep never touches
+a tab with no agent. Shell panes inside an archived agent tab come back as shells in
 the same directory.
 
 Sweeps run at herdr startup and on focus changes, at most once per
@@ -109,6 +121,33 @@ Claude Code deletes conversation files 30 days after they were last written
 (`cleanupPeriodDays`). Shelf keeps a copy of each archived Claude conversation
 and puts it back on restore if Claude has removed it. For other agents, their
 own retention applies.
+
+## Archive a tab now
+
+Press your archive key (above) in the tab you are done with. Shelf asks
+first:
+
+```
+ Archive "api-refactor"?
+ Last activity 3 days ago.
+ The tab closes; the restore picker brings it back.
+ y archive   any other key cancel
+```
+
+`y` archives and closes the tab; any other key, including Esc, cancels.
+Unlike a sweep, this ignores `idle_days` and dry-run mode, and archives the
+tab you are looking at. The question also warns about anything unusual, and
+`y` still archives:
+
+- a pane is still working (archiving stops it);
+- the tab has no agent, or a pane has no session id or runs an agent Shelf
+  cannot resume (that pane comes back as a shell);
+- the conversation is open in two panes here (both come back resuming it),
+  or in another tab (restore waits until that copy is closed).
+
+It refuses, with a notification instead of the question, only when the entry
+could not be restored correctly: a pane carrying another agent's session, or
+an invalid session id.
 
 ## Supported agents
 
@@ -193,8 +232,8 @@ schedule; see "Where things live" below.
 
 ## Command line
 
-For routine use, prefer the herdr actions `shelf.sweep-now` and
-`shelf.restore` over the raw commands below.
+For routine use, prefer the herdr actions `shelf.sweep-now`,
+`shelf.restore` and `shelf.archive-tab` over the raw commands below.
 
 To run a command by hand, find the plugin's directory with
 `herdr plugin list --plugin shelf --json` (the `plugin_root` field)
@@ -210,7 +249,10 @@ python3 -m shelf list                  list archived tabs with their ids
 python3 -m shelf restore <archive-id>  restore one archived tab
 ```
 
-Tab ids for `archive` come from `herdr tab list`.
+Tab ids for `archive` come from `herdr tab list`. It archives the focused
+tab too, but with no question to answer it still refuses a working pane, a
+missing session id, or a conversation open in two panes, which the archive key
+only warns about.
 
 `shelf.log` in the plugin's state directory is the durable log.
 `herdr plugin log list --plugin shelf` also shows recent plugin

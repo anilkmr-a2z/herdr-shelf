@@ -62,6 +62,61 @@ def decide(tab: dict, panes: list, table: dict, activity_of, idle: timedelta, no
     return None
 
 
+def _activity_line(stamps: list, now: datetime) -> str:
+    if not stamps:
+        return "No activity recorded for this tab yet."
+    days = max(0, (now - max(stamps)).days)  # a stamp in the future (clock skew) counts as today
+    if days == 0:
+        return "Last activity today."
+    return f"Last activity {days} day{'' if days == 1 else 's'} ago."
+
+
+def assess(tab: dict, panes: list, table: dict, activity_of, now: datetime, open_in: dict):
+    """(blocks, warnings, activity_line) for archiving one tab on request.
+
+    Unlike decide(), most of what a sweep refuses is only a warning here:
+    the user is asked first, and the record still restores correctly. A
+    block is something that would make the record restore the wrong
+    conversation, or never restore at all.
+    """
+    blocks, warnings, stamps, seen = [], [], [], set()
+    if any(p.get("agent_status") == "working" for p in panes):
+        warnings.append("A pane is still working; archiving stops it.")
+    agent_panes = [p for p in panes if p.get("agent")]
+    if not agent_panes:
+        warnings.append("No agent in this tab; it comes back as shells.")
+    for p in agent_panes:
+        session = p.get("agent_session") or {}
+        agent, value = session.get("agent"), session.get("value")
+        if not value:
+            warnings.append(f"Pane {p['pane_id']} has no session id; it comes back as a shell.")
+            continue
+        if agent != p.get("agent"):
+            # capture() would record the other agent's old session, and
+            # restore would resume that conversation in this pane's place.
+            blocks.append(f"{p['pane_id']}: agent does not match its session")
+            continue
+        if agent not in table:
+            warnings.append(f"Pane {p['pane_id']} runs {agent}, which shelf cannot resume; "
+                            "it comes back as a shell.")
+            continue
+        if not agents.valid_session_value(agent, value):
+            blocks.append(f"{p['pane_id']}: invalid session id")  # agents.relaunch_argv refuses it on restore
+            continue
+        key = activity.session_key(agent, value)
+        if key in seen:
+            warnings.append(f"Conversation {value[:8]} is open in two panes here; both come back resuming it.")
+        elif open_in.get(key, set()) - {tab.get("tab_id")}:
+            warnings.append(f"Conversation {value[:8]} is also open in another tab; "
+                            "restore waits until that copy is closed.")
+        seen.add(key)
+        last = activity_of(agent, value, p.get("terminal_id"))
+        if last is not None:
+            stamps.append(last)
+    # Three panes on one conversation would otherwise repeat the same line.
+    return blocks, list(dict.fromkeys(warnings)), _activity_line(stamps, now)
+
+
 def _open_sessions(tabs: list) -> dict:
     """Session key -> set of tab_ids an agent pane carries that session in,
     across the whole sweep, so decide() can refuse to archive a conversation
@@ -399,24 +454,78 @@ def _warn_if_open_elsewhere(tab_id: str, panes: list, open_in: dict) -> None:
             log.warning("%s: conversation %s is also open in another tab", tab_id, session["value"][:8])
 
 
+def _snapshot(client, state: Path, now: datetime):
+    """gather(), plus the activity lookup a manual archive is judged by."""
+    tabs = gather(client)
+    installed_at = _installed_at(state, now)
+    store = activity.ActivityStore(state)
+    store.update(lambda d: _record_presence(d, tabs, now))
+    return tabs, _activity_lookup(store.load(), installed_at)
+
+
+def _match(tabs: list, tab_id: str, terminals):
+    """The (tab, panes) asked for: by its set of terminal ids when given
+    (they survive herdr's positional ids shifting), otherwise by tab_id. An
+    empty list matches no tab, so a lost terminal list fails closed."""
+    if terminals is not None:
+        found = _find(tabs, frozenset(terminals))
+        if found is None:
+            raise archive.Skip("tab changed")
+        return found
+    found = next(((t, p) for t, p in tabs if t["tab_id"] == tab_id), None)
+    if found is None:
+        raise archive.Skip(f"no tab {tab_id}")
+    return found
+
+
+def _pane_identities(panes) -> frozenset:
+    return frozenset((p.get("pane_id"), p.get("tab_id"), p.get("terminal_id")) for p in panes)
+
+
+def preview(client, state_dir, table: dict, tab_id: str, now: datetime | None = None) -> dict:
+    """What the archive-tab popup shows for one tab: its label and terminal
+    ids, and assess()'s blocks, warnings and activity line.
+
+    It takes no sweep lock (the confirm step re-checks under it), so a tab
+    closing mid-read could shift herdr's positional ids and pair one tab's
+    label with another tab's panes. A pane.list read before gather() that
+    matches gather()'s own proves nothing shifted in between.
+    """
+    now = now or utc_now()
+    before = _pane_identities(client.call("pane.list").get("panes", []))
+    tabs, activity_of = _snapshot(client, Path(state_dir), now)
+    if _pane_identities(p for _, panes in tabs for p in panes) != before:
+        raise archive.Skip("tabs changed while being read; try again")
+    tab, panes = _match(tabs, tab_id, None)
+    blocks, warnings, activity_line = assess(tab, panes, table, activity_of, now, _open_sessions(tabs))
+    return {"tab_id": tab["tab_id"], "label": _display_label(tab, _workspace_labels(client)),
+            "terminals": sorted(archive.pane_terminals(panes)), "blocks": blocks, "warnings": warnings,
+            "activity": activity_line}
+
+
 def archive_now(client, cfg: dict, state_dir, table: dict, tab_id: str, now: datetime | None = None,
-                herdr_session: str = "default") -> str:
-    """Archive one tab immediately, ignoring idle_days and mode."""
+                herdr_session: str = "default", terminals=None, confirmed: bool = False) -> str:
+    """Archive one tab immediately, ignoring idle_days and mode.
+
+    terminals, when given, finds the tab by its terminal ids instead of
+    tab_id (see _match). confirmed=True is the archive-tab popup, whose user
+    has already seen assess()'s warnings: only its blocks refuse. Otherwise
+    decide() refuses as for a sweep, except that the focused tab is allowed:
+    an explicit request is usually made from the tab it names.
+    """
     now = now or utc_now()
     state = Path(state_dir)
     with FileLock(state / "sweep.lock", wait_seconds=ARCHIVE_NOW_LOCK_WAIT_SECONDS):
-        tabs = gather(client)
-        installed_at = _installed_at(state, now)
-        store = activity.ActivityStore(state)
-        store.update(lambda d: _record_presence(d, tabs, now))
-        activity_of = _activity_lookup(store.load(), installed_at)
-        match = next(((t, p) for t, p in tabs if t["tab_id"] == tab_id), None)
-        if match is None:
-            raise archive.Skip(f"no tab {tab_id}")
-        tab, panes = match
-        reason = decide(tab, panes, table, activity_of, timedelta(0), now)
+        tabs, activity_of = _snapshot(client, state, now)
+        tab, panes = _match(tabs, tab_id, terminals)
+        open_in = _open_sessions(tabs)
+        if confirmed:
+            blocks = assess(tab, panes, table, activity_of, now, open_in)[0]
+            reason = blocks[0] if blocks else None
+        else:
+            reason = decide({**tab, "focused": False}, panes, table, activity_of, timedelta(0), now)
         if reason:
             raise archive.Skip(reason)
-        _warn_if_open_elsewhere(tab_id, panes, _open_sessions(tabs))
+        _warn_if_open_elsewhere(tab["tab_id"], panes, open_in)
         return archive.archive_tab(client, archive.Archive(state), tab, panes, table, activity_of,
                                    cfg["keep_transcripts"], now, herdr_session)

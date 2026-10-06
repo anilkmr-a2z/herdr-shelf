@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
-from . import activity, agents, archive, config, migrate, picker, restore, session, sweep
+from . import activity, agents, archive, config, confirm, migrate, picker, restore, session, sweep
 from .api import Client, HerdrError
 from .util import FileLock, LockBusy, now
 
 PLUGIN_ID = "shelf"
-ALWAYS_HOOKS = ("track", "open-picker")
-USAGE = ("usage: python3 -m shelf {track | sweep [--if-due] | archive <tab-id> | open-picker | pick | "
-         "list | restore <archive-id>}")
+ALWAYS_HOOKS = ("track", "open-picker", "open-archive")
+USAGE = ("usage: python3 -m shelf {track | sweep [--if-due] | archive <tab-id> | open-archive | "
+         "confirm-archive | open-picker | pick | list | restore <archive-id>}")
 FMT = logging.Formatter("%(asctime)s %(levelname)s [%(session)s] %(message)s")
 CONFIG_ERROR_NOTIFY_INTERVAL_SECONDS = 3600
 
@@ -107,6 +109,13 @@ def _migration_incomplete(root: Path) -> bool:
 def _disabled_message(session_name) -> str:
     name = _display_session_name(session_name)
     return f"shelf is not enabled for herdr session '{name}'; add it to \"sessions\" in config.json"
+
+
+def _notify(client, body: str) -> None:
+    try:
+        client.call("notification.show", {"title": "shelf", "body": body})
+    except HerdrError as e:
+        log.warning("notification failed: %s", e)
 
 
 def _notify_disabled(client, session_name) -> None:
@@ -231,6 +240,93 @@ def main(argv=None) -> int:
         return 0  # hooks never fail loudly inside herdr
 
 
+@contextmanager
+def _logs_off_stderr():
+    """Keep log lines off a popup's screen while it runs: a line on stderr
+    (a restore or an archive logs several) would draw over it. shelf.log
+    still gets every line."""
+    on_stderr = [h for h in log.handlers if type(h) is logging.StreamHandler]
+    for handler in on_stderr:
+        log.removeHandler(handler)
+    quiet = logging.NullHandler()  # with no shelf.log, logging.lastResort would write to stderr
+    log.addHandler(quiet)
+    try:
+        yield
+    finally:
+        log.removeHandler(quiet)
+        for handler in on_stderr:
+            log.addHandler(handler)
+
+
+def _open_archive(client, session_state: Path) -> None:
+    """Ask before archiving the tab herdr invoked this action for
+    (HERDR_TAB_ID): a notification for a block, otherwise the popup."""
+    tab_id = os.environ.get("HERDR_TAB_ID")
+    if not tab_id:
+        _notify(client, "shelf: no tab to archive")
+        return
+    cfg = config.load(_config_dir())
+    found = sweep.preview(client, session_state, agents.table(cfg["agents"]), tab_id)
+    if found["blocks"]:
+        _notify(client, f'shelf: can\'t archive "{found["label"]}": {found["blocks"][0]}')
+        return
+    lines = confirm.lines(found)
+    try:
+        client.call("plugin.pane.open", {
+            "plugin_id": os.environ.get("HERDR_PLUGIN_ID") or PLUGIN_ID, "entrypoint": "archive-confirm",
+            "height": len(lines) + 3,  # the border, and a spare row for "Archiving..."
+            "env": {"SHELF_TAB_ID": found["tab_id"], "SHELF_TAB_LABEL": found["label"],
+                    "SHELF_TAB_TERMINALS": ",".join(found["terminals"]), "SHELF_CONFIRM_TEXT": "\n".join(lines)}})
+    except HerdrError as e:
+        if e.code != "ui_busy":
+            raise
+        _notify(client, "shelf: close the open popup or dialog first")
+
+
+def _confirm_archive(client, session_state: Path, session_name: str) -> None:
+    """The archive-confirm popup's own command: show the question, read one
+    key, and archive on y. Every outcome is a notification, since the popup
+    closes as soon as this returns."""
+    label = os.environ.get("SHELF_TAB_LABEL") or "tab"
+    with _logs_off_stderr():
+        try:
+            print(os.environ.get("SHELF_CONFIRM_TEXT", ""), flush=True)
+            key = confirm.read_key(sys.stdin.fileno())
+        except (EOFError, KeyboardInterrupt):
+            return
+        except Exception as e:
+            log.exception("confirm-archive failed")
+            _notify(client, f'shelf: can\'t archive "{label}": {e}')
+            return
+        if key not in (b"y", b"Y"):
+            return
+        # From here on, ignore Ctrl-C (read_key() has put the terminal back, so
+        # it works again) and SIGHUP (herdr closes this popup, hanging up its
+        # terminal, once the tab it was opened over is gone, which is the tab
+        # being archived): either could cut the archive short or stop the
+        # notification below. herdr follows SIGHUP with SIGTERM after 250 ms,
+        # so the notification still races that.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        print(" Archiving...", end="", flush=True)  # a newline would scroll the question off the popup
+        terminals = [t for t in os.environ.get("SHELF_TAB_TERMINALS", "").split(",") if t]
+        try:
+            cfg = config.load(_config_dir())
+            sweep.archive_now(client, cfg, session_state, agents.table(cfg["agents"]),
+                              os.environ.get("SHELF_TAB_ID", ""), herdr_session=session_name,
+                              terminals=terminals, confirmed=True)
+        except LockBusy:
+            _notify(client, "shelf: a sweep is running; try again in a moment")
+        except archive.Skip as e:
+            log.info("confirm-archive: can't archive %s: %s", label, e)
+            _notify(client, f'shelf: can\'t archive "{label}": {e}')
+        except Exception as e:
+            log.exception("confirm-archive failed")
+            _notify(client, f'shelf: can\'t archive "{label}": {e}')
+        else:
+            _notify(client, f'shelf: archived "{label}"')
+
+
 def _pick(state: Path) -> int:
     """The popup's own command. Any failure prints and waits so the popup does
     not just vanish; EOFError/KeyboardInterrupt (the user closing it) exit quietly.
@@ -254,20 +350,8 @@ def _pick(state: Path) -> int:
             except HerdrError as e:
                 log.warning("notification failed: %s", e)
 
-        # The popup's terminal belongs to curses while it runs: a log line on
-        # stderr (a restore logs several) would draw over it. shelf.log
-        # still gets every line.
-        on_stderr = [h for h in log.handlers if type(h) is logging.StreamHandler]
-        for handler in on_stderr:
-            log.removeHandler(handler)
-        quiet = logging.NullHandler()  # with no shelf.log, logging.lastResort would write to stderr
-        log.addHandler(quiet)
-        try:
+        with _logs_off_stderr():
             picker.run(arch, do_restore, now, notify=notify)
-        finally:
-            log.removeHandler(quiet)
-            for handler in on_stderr:
-                log.addHandler(handler)
     except (EOFError, KeyboardInterrupt):
         pass
     except Exception as e:
@@ -377,6 +461,30 @@ def _dispatch(command: str, args: list, state: Path, session_name) -> int:
                     pass
                 return 0
             raise
+        return 0
+    if command == "open-archive":
+        client = Client()
+        if not allowed():
+            _notify_disabled(client, session_name)
+            return 0
+        if _migration_incomplete(state):
+            _notify(client, _MIGRATING_MESSAGE)
+            return 0
+        try:
+            _open_archive(client, session_state)
+        except Exception as e:
+            log.exception("open-archive failed")
+            _notify(client, f"shelf: can't archive this tab: {e}")
+        return 0
+    if command == "confirm-archive":
+        client = Client()
+        if not allowed():
+            _notify_disabled(client, session_name)
+            return 0
+        if _migration_incomplete(state):
+            _notify(client, _MIGRATING_MESSAGE)
+            return 0
+        _confirm_archive(client, session_state, session_name)
         return 0
     if command in ("archive", "restore") and not args:
         print(USAGE, file=sys.stderr)

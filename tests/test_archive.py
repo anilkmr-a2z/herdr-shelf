@@ -76,6 +76,28 @@ class CaptureTest(unittest.TestCase):
                                     herdr_session="cao")
         self.assertEqual(record["herdr_session"], "cao")
 
+    def test_a_session_with_an_empty_value_is_recorded_as_a_shell(self):
+        panes = [dict(p) for p in PANES]
+        panes[0]["agent_session"] = dict(panes[0]["agent_session"], value="")
+        record, files = archive.capture(Client(fake_herdr(self).path), TAB, panes, self.table, self.activity_of,
+                                        True, T0)
+        self.assertEqual(record["panes"]["w1:p3"], {"cwd": "/src/api"})
+        self.assertEqual(files, [])
+
+    def test_a_session_without_a_value_key_is_recorded_as_a_shell(self):
+        panes = [dict(p) for p in PANES]
+        panes[0]["agent_session"] = {"agent": "claude", "kind": "id", "source": "herdr:claude"}
+        record, _ = archive.capture(Client(fake_herdr(self).path), TAB, panes, self.table, self.activity_of,
+                                    True, T0)
+        self.assertEqual(record["panes"]["w1:p3"], {"cwd": "/src/api"})
+
+    def test_a_non_dict_session_is_recorded_as_a_shell(self):
+        panes = [dict(p) for p in PANES]
+        panes[0]["agent_session"] = "S1"
+        record, _ = archive.capture(Client(fake_herdr(self).path), TAB, panes, self.table, self.activity_of,
+                                    True, T0)
+        self.assertEqual(record["panes"]["w1:p3"], {"cwd": "/src/api"})
+
     def test_last_activity_uses_the_terminal_start_when_more_recent(self):
         # w1:p3's terminal_id is "term_a"; a real activity_of (built the same
         # way a sweep builds one) must fold that terminal's agent_started_at

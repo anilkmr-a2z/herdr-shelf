@@ -15,8 +15,9 @@ for the full design (activity model, eligibility rules, state layout).
 
 - `shelf/__init__.py`: package marker, `__version__`.
 - `shelf/__main__.py`: CLI entry point (`track`, `sweep [--if-due]`,
-  `archive <tab-id>`, `open-picker`, `pick`, `list`, `restore <id>`). Runs the
-  migration first, then gates every command on the herdr session allowlist.
+  `archive <tab-id>`, `open-archive`, `confirm-archive`, `open-picker`,
+  `pick`, `list`, `restore <id>`). Runs the migration first, then gates every
+  command on the herdr session allowlist.
 - `shelf/api.py`: minimal client for herdr's local socket (one JSON request
   per line). `HerdrError.definite` tells a definite refusal apart from an
   unknown outcome (timeout, bad reply).
@@ -28,8 +29,10 @@ for the full design (activity model, eligibility rules, state layout).
   activity.
 - `shelf/history.py`: optional per-agent history readers (Claude, Codex) that
   read the agent's own session files for activity older than Shelf itself.
-- `shelf/sweep.py`: eligibility (`decide()`), gathering tabs/panes, dry-run
-  reporting vs. live archiving, one summary notification per sweep.
+- `shelf/sweep.py`: eligibility (`decide()` for sweeps; `assess()` for the
+  archive-tab popup's blocks and warnings), gathering tabs/panes, dry-run
+  reporting vs. live archiving, one summary notification per sweep;
+  `archive_now()` and `preview()` for archiving one tab on request.
 - `shelf/archive.py`: archive records -- create, list, load, delete;
   `capture()` builds a record; `archive_tab()` writes it, then closes the tab.
 - `shelf/restore.py`: rebuilds a tab from an archive record and resumes its
@@ -37,6 +40,8 @@ for the full design (activity model, eligibility rules, state layout).
 - `shelf/picker.py`: the restore popup. Pure logic (`State`, `reduce`,
   `render`, `apply`) tested without a terminal, plus a thin curses loop
   (`run`); `tests/test_picker_tty.py` drives that loop in a pseudo-terminal.
+- `shelf/confirm.py`: the archive-tab popup's text (`lines()`) and its
+  one-key read in raw tty mode (`read_key()`).
 - `shelf/session.py`: `herdr_session_name()` -- recovers the herdr session
   name from `HERDR_SOCKET_PATH`.
 - `shelf/migrate.py`: one-way, self-healing merge of pre-0.3.0 root-level
@@ -83,10 +88,16 @@ not a style choice.
   (`HerdrError.definite`) or a live re-check proves the tab is still open.
   When the outcome of `tab.close` is unknown, the record is kept rather than
   risked as the only surviving copy.
-- Never archive a tab that is focused, or has any pane `working`, or whose
-  conversation is open in more than one pane or more than one tab. A manual
-  `archive <tab-id>` is the one exception: it proceeds anyway (with a
-  warning) since it targets one tab explicitly.
+- A sweep never archives a tab that is focused, or has any pane `working`,
+  or whose conversation is open in more than one pane or more than one tab.
+  `archive <tab-id>` refuses the same tabs except a focused one (it is an
+  explicit request, usually made from the tab it names), and proceeds, with
+  a logged warning, when the conversation is open in another tab. The
+  archive-tab popup (`open-archive`, then `confirm-archive`) ignores the
+  focused-tab rule, shows the others as warnings, and archives on `y`; it refuses only what
+  `sweep.assess()` calls a block, an entry that could not be restored
+  correctly. `sweep.preview()` updates `activity.json` without holding
+  `sweep.lock`; everything that archives holds it.
 - When anything about a tab is uncertain (a failed `pane.process_info`, an
   unrecognized event shape, an ambiguous id match), archive nothing for that
   tab this sweep rather than guess.
@@ -94,8 +105,9 @@ not a style choice.
   while holding `activity.lock`. `sweep.lock` is held for the duration of a
   sweep, a restore, or a picker delete; `activity.lock` is held only for the
   brief read-modify-write of `activity.json`.
-- Hooks (`track`, `sweep --if-due`, `open-picker`) always exit 0, even on an
-  unexpected exception, so a bug in the plugin never breaks herdr itself.
+- Hooks (`track`, `sweep --if-due`, `open-picker`, `open-archive`) always
+  exit 0, even on an unexpected exception, so a bug in the plugin never
+  breaks herdr itself.
 - State is per herdr session, under `sessions/<name>/` in the plugin's state
   directory. Every herdr session shares one plugin install, so a session
   allowlist (`sessions` in `config.json`, default `["default"]`) gates every

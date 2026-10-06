@@ -97,6 +97,90 @@ class DecideTest(unittest.TestCase):
         self.assertIn("also open in another pane", reason)
 
 
+class AssessTest(unittest.TestCase):
+    table = agents.table()
+
+    def assess(self, panes, days_ago=10, open_in=None):
+        tab = {"tab_id": "w1:t1", "focused": True}
+        activity_of = lambda a, v, terminal_id=None: None if days_ago is None else T0 - timedelta(days=days_ago)
+        return sweep.assess(tab, panes, self.table, activity_of, T0, open_in or {})
+
+    def test_activity_line(self):
+        cases = [(0, "Last activity today."), (1, "Last activity 1 day ago."),
+                 (12, "Last activity 12 days ago."), (-1, "Last activity today."),
+                 (None, "No activity recorded for this tab yet.")]
+        for days_ago, expected in cases:
+            with self.subTest(days_ago=days_ago):
+                self.assertEqual(self.assess([pane("p1")], days_ago=days_ago), ([], [], expected))
+
+    def test_activity_line_uses_the_most_recent_pane(self):
+        stamps = {"A": T0 - timedelta(days=9), "B": T0 - timedelta(days=2)}
+        activity_of = lambda a, v, terminal_id=None: stamps[v]
+        tab = {"tab_id": "w1:t1"}
+        result = sweep.assess(tab, [pane("p1", session="A"), pane("p2", session="B")], self.table,
+                              activity_of, T0, {})
+        self.assertEqual(result[2], "Last activity 2 days ago.")
+
+    def test_focused_and_recent_are_not_warnings(self):
+        self.assertEqual(self.assess([pane("p1")], days_ago=0)[:2], ([], []))
+
+    def test_warnings(self):
+        cases = [
+            ("working", [pane("p1", status="working")], {}, "A pane is still working; archiving stops it."),
+            ("working shell", [pane("p1"), pane("p2", agent=None, status="working")], {},
+             "A pane is still working; archiving stops it."),
+            ("shell only", [pane("p1", agent=None)], {}, "No agent in this tab; it comes back as shells."),
+            ("no session", [pane("p1", session=None)], {}, "Pane p1 has no session id; it comes back as a shell."),
+            ("unknown agent", [pane("p1", agent="mystery")], {},
+             "Pane p1 runs mystery, which shelf cannot resume; it comes back as a shell."),
+            ("two panes", [pane("p1", session="S"), pane("p2", session="S")], {},
+             "Conversation S is open in two panes here; both come back resuming it."),
+            ("another tab", [pane("p1", session="S")], {"open_in": {"claude:S": {"w1:t1", "w1:t9"}}},
+             "Conversation S is also open in another tab; restore waits until that copy is closed."),
+        ]
+        for name, panes, kw, expected in cases:
+            with self.subTest(name):
+                blocks, warnings, _ = self.assess(panes, **kw)
+                self.assertEqual(blocks, [])
+                self.assertEqual(warnings, [expected])
+
+    def test_own_tab_in_open_in_is_not_a_warning(self):
+        self.assertEqual(self.assess([pane("p1", session="S")], open_in={"claude:S": {"w1:t1"}})[1], [])
+
+    def test_several_warnings_at_once(self):
+        panes = [pane("p1", status="working"), pane("p2", session=None)]
+        self.assertEqual(self.assess(panes)[1], ["A pane is still working; archiving stops it.",
+                                                 "Pane p2 has no session id; it comes back as a shell."])
+
+    def test_blocks(self):
+        mismatched = pane("p1")
+        mismatched["agent"] = "codex"
+        cases = [("invalid session id", [pane("p1", session="-rf")], "p1: invalid session id"),
+                 ("agent mismatch", [mismatched], "p1: agent does not match its session")]
+        for name, panes, expected in cases:
+            with self.subTest(name):
+                blocks, warnings, _ = self.assess(panes)
+                self.assertEqual(blocks, [expected])
+                self.assertEqual(warnings, [])
+
+    def test_empty_session_value_is_the_no_session_warning(self):
+        p = pane("p1")
+        p["agent_session"]["value"] = ""
+        self.assertEqual(self.assess([p])[:2], ([], ["Pane p1 has no session id; it comes back as a shell."]))
+
+    def test_three_panes_on_one_conversation_warn_once(self):
+        panes = [pane("p1", session="S"), pane("p2", session="S"), pane("p3", session="S")]
+        self.assertEqual(self.assess(panes)[1],
+                         ["Conversation S is open in two panes here; both come back resuming it."])
+
+    def test_two_panes_here_and_another_tab(self):
+        panes = [pane("p1", session="S"), pane("p2", session="S")]
+        self.assertEqual(self.assess(panes, open_in={"claude:S": {"w1:t1", "w1:t9"}})[1], [
+            "Conversation S is also open in another tab; restore waits until that copy is closed.",
+            "Conversation S is open in two panes here; both come back resuming it.",
+        ])
+
+
 class RunTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -218,11 +302,96 @@ class RunTest(unittest.TestCase):
                                        herdr_session="cao")
         self.assertEqual(archive.Archive(self.state).load(archive_id)["herdr_session"], "cao")
 
-    def test_archive_now_refuses_focused_and_missing(self):
-        with self.assertRaises(archive.Skip):
-            sweep.archive_now(Client(self.fake.path), self.cfg, self.state, agents.table(), "w1:t2", now=T0)
-        with self.assertRaises(archive.Skip):
-            sweep.archive_now(Client(self.fake.path), self.cfg, self.state, agents.table(), "w1:t404", now=T0)
+    def archive_now(self, tab_id, **kw):
+        return sweep.archive_now(Client(self.fake.path), self.cfg, self.state, agents.table(), tab_id, now=T0, **kw)
+
+    def test_archive_now_archives_the_focused_tab(self):
+        self.assertTrue(self.archive_now("w1:t2"))
+        self.assertIn(("tab.close", {"tab_id": "w1:t2"}), self.fake.calls)
+
+    def test_archive_now_refuses_a_missing_tab(self):
+        with self.assertRaisesRegex(archive.Skip, "no tab w1:t404"):
+            self.archive_now("w1:t404")
+
+    def test_archive_now_unconfirmed_still_refuses_a_working_tab(self):
+        self.panes[0]["agent_status"] = "working"
+        with self.assertRaisesRegex(archive.Skip, "working"):
+            self.archive_now("w1:t1")
+
+    def test_archive_now_confirmed_archives_through_warnings(self):
+        self.panes[0]["agent_status"] = "working"
+        self.assertTrue(self.archive_now("w1:t1", confirmed=True))
+        self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+
+    def test_archive_now_confirmed_still_refuses_a_block(self):
+        self.panes[0]["agent_session"]["value"] = "-rf"
+        with self.assertRaisesRegex(archive.Skip, "invalid session id"):
+            self.archive_now("w1:t1", confirmed=True)
+        self.assertNotIn("tab.close", self.fake.methods())
+
+    def test_archive_now_finds_the_tab_by_terminals_after_its_id_shifts(self):
+        # The popup was opened for "w1:t5"; since then herdr renumbered, and
+        # the same terminals now sit in "w1:t1".
+        self.assertTrue(self.archive_now("w1:t5", terminals=["term_w1:p1"], confirmed=True))
+        self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+
+    def test_archive_now_refuses_when_no_tab_has_the_terminals(self):
+        with self.assertRaisesRegex(archive.Skip, "tab changed"):
+            self.archive_now("w1:t1", terminals=["term_gone"], confirmed=True)
+        self.assertNotIn("tab.close", self.fake.methods())
+
+    def test_preview(self):
+        result = sweep.preview(Client(self.fake.path), self.state, agents.table(), "w1:t1", now=T0)
+        self.assertEqual(result, {"tab_id": "w1:t1", "label": "old", "terminals": ["term_w1:p1"], "blocks": [],
+                                  "warnings": [], "activity": "Last activity 23 days ago."})
+        self.assertNotIn("tab.close", self.fake.methods())
+
+    def test_preview_of_the_focused_working_tab_only_warns(self):
+        self.panes[1]["agent_status"] = "working"
+        result = sweep.preview(Client(self.fake.path), self.state, agents.table(), "w1:t2", now=T0)
+        self.assertEqual((result["blocks"], result["warnings"]),
+                         ([], ["A pane is still working; archiving stops it."]))
+
+    def test_preview_of_a_missing_tab(self):
+        with self.assertRaisesRegex(archive.Skip, "no tab w1:t404"):
+            sweep.preview(Client(self.fake.path), self.state, agents.table(), "w1:t404", now=T0)
+
+    def test_preview_refuses_when_a_tab_closes_while_it_reads(self):
+        # "old" (w1:t1) closes between gather()'s tab.list and pane.list:
+        # herdr renumbers "here" to w1:t1, so without a check the popup would
+        # ask about "old" while holding "here"'s panes and terminals.
+        reads = {"n": 0}
+
+        def pane_list(p):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return {"panes": [dict(x) for x in self.panes]}
+            return {"panes": [dict(self.panes[1], tab_id="w1:t1")]}
+
+        self.fake.handlers["pane.list"] = pane_list
+        with self.assertRaisesRegex(archive.Skip, "tabs changed while being read"):
+            sweep.preview(Client(self.fake.path), self.state, agents.table(), "w1:t1", now=T0)
+
+    def test_preview_takes_no_sweep_lock(self):
+        with FileLock(self.state / "sweep.lock"):
+            result = sweep.preview(Client(self.fake.path), self.state, agents.table(), "w1:t1", now=T0)
+        self.assertEqual(result["label"], "old")
+
+    def test_archive_now_ignores_a_stale_id_that_names_another_live_tab(self):
+        # The popup was opened for "old" as w1:t2; "old" is w1:t1 now, and w1:t2 is "here".
+        self.assertTrue(self.archive_now("w1:t2", terminals=["term_w1:p1"], confirmed=True))
+        self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+        self.assertNotIn(("tab.close", {"tab_id": "w1:t2"}), self.fake.calls)
+
+    def test_archive_now_with_an_empty_terminal_list_archives_nothing(self):
+        with self.assertRaisesRegex(archive.Skip, "tab changed"):
+            self.archive_now("w1:t1", terminals=[], confirmed=True)
+        self.assertNotIn("tab.close", self.fake.methods())
+
+    def test_a_stale_id_does_not_warn_that_the_tab_is_open_elsewhere(self):
+        with mock.patch.object(sweep.log, "warning") as warning:
+            self.archive_now("w1:t5", terminals=["term_w1:p1"], confirmed=True)
+        warning.assert_not_called()
 
     def test_live_skips_a_target_that_becomes_ineligible_before_closing(self):
         self.cfg["mode"] = "live"

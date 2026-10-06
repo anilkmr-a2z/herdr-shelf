@@ -2,11 +2,13 @@ import io
 import json
 import logging
 import os
+import signal
 import tempfile
+import termios
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -103,7 +105,7 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("Expecting property name", err.getvalue())
 
     def test_hooks_exit_zero_without_herdr(self):
-        for argv in (["track"], ["sweep", "--if-due"], ["open-picker"]):
+        for argv in (["track"], ["sweep", "--if-due"], ["open-picker"], ["open-archive"]):
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
                 self.assertEqual(main(argv), 0)
 
@@ -416,6 +418,249 @@ class MainTest(unittest.TestCase):
                       fake.calls)
 
 
+def _pane(pane_id, tab, session, status="idle"):
+    return {"pane_id": pane_id, "tab_id": tab, "terminal_id": "term_" + pane_id, "cwd": "/src",
+            "agent": "claude", "agent_status": status,
+            "agent_session": {"agent": "claude", "kind": "id", "value": session, "source": "herdr:claude"}}
+
+
+class ArchiveTabTest(unittest.TestCase):
+    """open-archive (the archive-tab action) and confirm-archive (its popup)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake = FakeHerdr()
+        self.addCleanup(self.fake.close)
+        env = mock.patch.dict(os.environ, {
+            "HERDR_PLUGIN_STATE_DIR": self.tmp.name,
+            "XDG_CONFIG_HOME": os.path.join(self.tmp.name, "xdg-config"),
+            "XDG_STATE_HOME": os.path.join(self.tmp.name, "xdg-state"),
+            "CLAUDE_CONFIG_DIR": os.path.join(self.tmp.name, "claude"),
+            "CODEX_HOME": os.path.join(self.tmp.name, "codex"),
+            "HERDR_SOCKET_PATH": self.fake.path,
+            "HERDR_PLUGIN_ID": "shelf",
+            "HERDR_TAB_ID": "w1:t1",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HERDR_PLUGIN_CONFIG_DIR", None)
+        self.addCleanup(MainTest._reset_shelf_logger)
+        self.session = Path(self.tmp.name) / "sessions" / "default"
+        self.tabs = [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "old", "focused": True}]
+        self.panes = [_pane("w1:p1", "w1:t1", "OLD")]
+        self.fake.handlers.update({
+            "tab.list": lambda p: {"tabs": [dict(t) for t in self.tabs]},
+            "pane.list": lambda p: {"panes": [dict(x) for x in self.panes]},
+            "workspace.list": lambda p: {"workspaces": [{"workspace_id": "w1", "label": "main"}]},
+            "notification.show": lambda p: {"type": "ok"},
+            "plugin.pane.open": lambda p: {"type": "ok"},
+            "layout.export": self.layout_export,
+            "pane.process_info": lambda p: {"process_info": {"foreground_processes": [{"name": "claude",
+                                                                                      "argv": ["claude"]}]}},
+            "tab.close": self.close_tab,
+        })
+        (self.session / "installed_at").parent.mkdir(parents=True)
+        (self.session / "installed_at").write_text("2026-01-01T00:00:00Z\n")
+        (self.session / "activity.json").write_text(json.dumps(
+            {"claude:OLD": {"first_seen": "2026-01-01T00:00:00Z",
+                            "last_active": iso(now() - timedelta(days=3, hours=1))}}))
+
+    def layout_export(self, p):
+        pane_id = next(x["pane_id"] for x in self.panes if x["tab_id"] == p["tab_id"])
+        return {"layout": {"workspace_id": "w1", "tab_id": p["tab_id"], "zoomed": False,
+                           "focused_pane_id": pane_id, "root": {"type": "pane", "pane_id": pane_id, "cwd": "/src"}}}
+
+    def close_tab(self, p):
+        self.tabs = [t for t in self.tabs if t["tab_id"] != p["tab_id"]]
+        self.panes = [x for x in self.panes if x["tab_id"] != p["tab_id"]]
+        return {"type": "ok"}
+
+    def notifications(self):
+        return [params["body"] for method, params in self.fake.calls if method == "notification.show"]
+
+    def opened(self):
+        return [params for method, params in self.fake.calls if method == "plugin.pane.open"]
+
+    def run_main(self, argv):
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+            code = main(argv)
+        self.assertEqual(code, 0)
+        self.err = err.getvalue()
+        return out.getvalue()
+
+    def write_config(self, obj):
+        config_dir = os.path.join(self.tmp.name, "config")
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as f:
+            json.dump(obj, f)
+        os.environ["HERDR_PLUGIN_CONFIG_DIR"] = config_dir
+
+    def leave_migration_incomplete(self):
+        (Path(self.tmp.name) / "activity.json").write_text("{}")
+        return mock.patch("shelf.__main__.migrate.merge_into_default_session")
+
+    # -- open-archive --
+
+    def test_open_archive_opens_the_popup_with_the_question(self):
+        self.run_main(["open-archive"])
+        text = "\n".join([' Archive "old"?', " Last activity 3 days ago.",
+                          " The tab closes; the restore picker brings it back.", " y archive   any other key cancel"])
+        self.assertEqual(self.opened(), [{
+            "plugin_id": "shelf", "entrypoint": "archive-confirm", "height": 7,
+            "env": {"SHELF_TAB_ID": "w1:t1", "SHELF_TAB_LABEL": "old", "SHELF_TAB_TERMINALS": "term_w1:p1",
+                    "SHELF_CONFIRM_TEXT": text}}])
+        self.assertEqual(self.notifications(), [])
+
+    def test_open_archive_shows_warnings_in_the_popup(self):
+        self.panes[0]["agent_status"] = "working"
+        self.run_main(["open-archive"])
+        (opened,) = self.opened()
+        self.assertIn(" A pane is still working; archiving stops it.", opened["env"]["SHELF_CONFIRM_TEXT"])
+        self.assertEqual(opened["height"], 8)
+
+    def test_open_archive_notifies_a_block_and_opens_nothing(self):
+        self.panes[0]["agent_session"]["value"] = "-rf"
+        self.run_main(["open-archive"])
+        self.assertEqual(self.opened(), [])
+        self.assertEqual(self.notifications(), ['shelf: can\'t archive "old": w1:p1: invalid session id'])
+
+    def test_open_archive_without_a_tab_id(self):
+        os.environ.pop("HERDR_TAB_ID")
+        self.run_main(["open-archive"])
+        self.assertEqual(self.notifications(), ["shelf: no tab to archive"])
+
+    def test_open_archive_for_a_tab_that_is_gone(self):
+        os.environ["HERDR_TAB_ID"] = "w1:t404"
+        self.run_main(["open-archive"])
+        self.assertEqual(self.notifications(), ["shelf: can't archive this tab: no tab w1:t404"])
+
+    def test_open_archive_when_a_popup_is_already_open(self):
+        def busy(_params):
+            raise FakeError("ui_busy", "busy")
+
+        self.fake.handlers["plugin.pane.open"] = busy
+        self.run_main(["open-archive"])
+        self.assertEqual(self.notifications(), ["shelf: close the open popup or dialog first"])
+
+    def test_open_archive_when_the_popup_cannot_be_opened(self):
+        def refuse(_params):
+            raise FakeError("invalid_params", "no such entrypoint")
+
+        self.fake.handlers["plugin.pane.open"] = refuse
+        self.run_main(["open-archive"])
+        (note,) = self.notifications()
+        self.assertTrue(note.startswith("shelf: can't archive this tab: "), note)
+        self.assertIn("no such entrypoint", note)
+
+    def test_open_archive_with_an_invalid_config(self):
+        self.write_config({"idle_days": -1})
+        self.run_main(["open-archive"])
+        self.assertEqual(self.opened(), [])
+        (note,) = self.notifications()
+        self.assertTrue(note.startswith("shelf: can't archive this tab: "), note)
+
+    def test_open_archive_while_a_migration_is_incomplete(self):
+        with self.leave_migration_incomplete():
+            self.run_main(["open-archive"])
+        self.assertEqual(self.opened(), [])
+        self.assertEqual(self.notifications(),
+                         ["shelf: migrating state from an older version; try again in a moment"])
+
+    # -- confirm-archive --
+
+    def confirm(self, key=None, tab_id="w1:t1", terminals="term_w1:p1", read_error=None):
+        os.environ.update({"SHELF_TAB_ID": tab_id, "SHELF_TAB_LABEL": "old", "SHELF_TAB_TERMINALS": terminals,
+                           "SHELF_CONFIRM_TEXT": ' Archive "old"?'})
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in
+                                 ("SHELF_TAB_ID", "SHELF_TAB_LABEL", "SHELF_TAB_TERMINALS", "SHELF_CONFIRM_TEXT")])
+        with mock.patch("shelf.__main__.confirm.read_key", return_value=key, side_effect=read_error), \
+                mock.patch("shelf.__main__.signal.signal") as self.set_signal:
+            return self.run_main(["confirm-archive"])
+
+    def test_confirm_archive_y_archives(self):
+        out = self.confirm(b"y")
+        self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+        self.assertEqual(self.notifications(), ['shelf: archived "old"'])
+        self.assertEqual(out, ' Archive "old"?\n Archiving...')
+        self.assertEqual(self.err, "")
+        self.assertEqual(self.set_signal.call_args_list,
+                         [mock.call(signal.SIGINT, signal.SIG_IGN), mock.call(signal.SIGHUP, signal.SIG_IGN)])
+
+    def test_confirm_archive_capital_y_archives(self):
+        self.confirm(b"Y")
+        self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+
+    def test_confirm_archive_archives_through_warnings(self):
+        self.panes[0]["agent_status"] = "working"
+        self.confirm(b"y")
+        self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+
+    def test_confirm_archive_any_other_key_cancels(self):
+        for key in (b"n", b"\x1b", b"\x03", b""):
+            with self.subTest(key=key):
+                self.fake.calls.clear()
+                out = self.confirm(key)
+                self.assertNotIn("tab.close", self.fake.methods())
+                self.assertEqual(self.notifications(), [])
+                self.assertNotIn("Archiving", out)
+                self.set_signal.assert_not_called()
+
+    def test_confirm_archive_when_the_key_cannot_be_read(self):
+        self.confirm(read_error=termios.error(25, "Inappropriate ioctl for device"))
+        self.assertNotIn("tab.close", self.fake.methods())
+        (note,) = self.notifications()
+        self.assertTrue(note.startswith('shelf: can\'t archive "old": '), note)
+        self.set_signal.assert_not_called()
+
+    def test_confirm_archive_ctrl_c_before_a_key_cancels_quietly(self):
+        self.confirm(read_error=KeyboardInterrupt)
+        self.assertNotIn("tab.close", self.fake.methods())
+        self.assertEqual(self.notifications(), [])
+
+    def test_confirm_archive_with_an_invalid_config(self):
+        self.write_config({"idle_days": -1})
+        self.confirm(b"y")
+        self.assertNotIn("tab.close", self.fake.methods())
+        (note,) = self.notifications()
+        self.assertTrue(note.startswith('shelf: can\'t archive "old": '), note)
+
+    def test_confirm_archive_while_a_migration_is_incomplete(self):
+        with self.leave_migration_incomplete():
+            self.confirm(b"y")
+        self.assertNotIn("tab.close", self.fake.methods())
+        self.assertEqual(self.notifications(),
+                         ["shelf: migrating state from an older version; try again in a moment"])
+
+    def test_confirm_archive_keeps_a_refusal_out_of_the_popup_and_without_a_traceback(self):
+        self.confirm(b"y", terminals="term_gone")
+        self.assertEqual(self.err, "")
+        log_text = (Path(self.tmp.name) / "shelf.log").read_text()
+        self.assertIn("can't archive old: tab changed", log_text)
+        self.assertNotIn("Traceback", log_text)
+
+    def test_confirm_archive_finds_the_tab_after_its_id_shifts(self):
+        self.confirm(b"y", tab_id="w1:t7")
+        self.assertIn(("tab.close", {"tab_id": "w1:t1"}), self.fake.calls)
+
+    def test_confirm_archive_when_the_tab_is_gone(self):
+        self.confirm(b"y", terminals="term_gone")
+        self.assertNotIn("tab.close", self.fake.methods())
+        self.assertEqual(self.notifications(), ['shelf: can\'t archive "old": tab changed'])
+
+    def test_confirm_archive_notifies_a_block(self):
+        self.panes[0]["agent_session"]["value"] = "-rf"
+        self.confirm(b"y")
+        self.assertNotIn("tab.close", self.fake.methods())
+        self.assertEqual(self.notifications(), ['shelf: can\'t archive "old": w1:p1: invalid session id'])
+
+    def test_confirm_archive_while_a_sweep_holds_the_lock(self):
+        with mock.patch("shelf.sweep.ARCHIVE_NOW_LOCK_WAIT_SECONDS", 0.1), FileLock(self.session / "sweep.lock"):
+            self.confirm(b"y")
+        self.assertNotIn("tab.close", self.fake.methods())
+        self.assertEqual(self.notifications(), ["shelf: a sweep is running; try again in a moment"])
+
+
 class SessionAllowlistTest(unittest.TestCase):
     """Shelf must only act in herdr sessions the user lists (default: only
     "default"), and keep separate state per herdr session."""
@@ -522,6 +767,17 @@ class SessionAllowlistTest(unittest.TestCase):
         self.assertNotIn("plugin.pane.open", fake.methods())
         self.assertIn(("notification.show", {"title": "shelf", "body": "shelf is not enabled for herdr session cao"}),
                       fake.calls)
+
+    def test_disabled_open_and_confirm_archive_show_a_notification_and_archive_nothing(self):
+        fake = FakeHerdr()
+        self.addCleanup(fake.close)
+        fake.handlers["notification.show"] = lambda p: {"type": "ok"}
+        self.use_cao_socket_linked_to(fake)
+        for argv in (["open-archive"], ["confirm-archive"]):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                self.assertEqual(main(argv), 0)
+        self.assertEqual(fake.methods(), ["notification.show", "notification.show"])
+        self.assertFalse(self.cao_session.exists())
 
     # -- Manual commands: a disabled session prints a message and exits 1. --
 

@@ -224,7 +224,10 @@ def capture(client, tab: dict, panes: list, table: dict, activity_of, keep_trans
     for pane in panes:
         meta = {"cwd": pane.get("cwd")}
         session = pane.get("agent_session")
-        if pane.get("agent") and session and session.get("agent") in table:
+        # A session with no usable value is recorded as a plain shell, which
+        # is what sweep.assess() tells the user will happen, rather than as an
+        # agent with an empty session (or a KeyError on a missing "value").
+        if pane.get("agent") and isinstance(session, dict) and session.get("value") and session.get("agent") in table:
             agent = session["agent"]
             last = activity_of(agent, session["value"], pane.get("terminal_id"))
             launch_argv = _launch_argv(client, pane["pane_id"], table[agent])

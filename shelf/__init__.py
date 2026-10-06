@@ -1,3 +1,3 @@
 """herdr-shelf: archive idle agent tabs in herdr and restore them later."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
