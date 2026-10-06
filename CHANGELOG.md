@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 - unreleased
+## 0.5.0 - 2026-10-06
 
 - Add the `shelf.archive-tab` action: bound to a key, it asks whether to
   archive the current tab, showing when it was last active and warning about
